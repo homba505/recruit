@@ -89,7 +89,7 @@ asyncio.run(_init_db())
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("⚠️ TELEGRAM_BOT_TOKEN is not set in environment")
-  # <--- paste if env not used
+
 
 # Recruiters + passwords (5 letters)
 RECRUITERS: Dict[str, str] = {
