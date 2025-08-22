@@ -70,12 +70,26 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+# ---- DB init: create tables if missing ----
+from db import engine
+from db_models import Base
+
+async def _init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# run once at startup
+asyncio.run(_init_db())
+# -------------------------------------------
 
 # ---------------------------------------------------------------------------
 # CONFIG (edit to match your environment) ----------------------------------
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.getenv("7347942497:AAGSUW_3HTntqvI5-maPCt25aqLTCCE7UXg", "7347942497:AAGSUW_3HTntqvI5-maPCt25aqLTCCE7UXg")  # <--- paste if env not used
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("⚠️ TELEGRAM_BOT_TOKEN is not set in environment")
+  # <--- paste if env not used
 
 # Recruiters + passwords (5 letters)
 RECRUITERS: Dict[str, str] = {
@@ -130,28 +144,7 @@ LOGIN_NAME, LOGIN_PASS, FORM_NAME, FORM_PHONE, FORM_EXP, FORM_ESCROW, FORM_READY
 # STORAGE STRUCTURES --------------------------------------------------------
 # ---------------------------------------------------------------------------
 
-# sessions[user_id] = {"name": str, "admin": bool, "last_active": ts}
-sessions: Dict[int, Dict[str, Any]] = {}
 
-# driver_records[id] = record (see _new_driver_record)
-driver_records: Dict[int, Dict[str, Any]] = {}
-
-# recruiter_drivers[user_id] = [driver_id, ...]
-recruiter_drivers: Dict[int, List[int]] = {}
-
-# Map outgoing company message -> driver id: (group_id, msg_id) -> driver_id
-group_message_index: Dict[Tuple[int, int], int] = {}
-
-# Temp form buffers keyed by user until submission
-form_buffers: Dict[int, Dict[str, Any]] = {}
-
-# Pending repost requests: req_id -> data
-repost_requests: Dict[str, Dict[str, Any]] = {}
-_repost_counter = 0
-
-# ---------------------------------------------------------------------------
-# LOGGING -------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
