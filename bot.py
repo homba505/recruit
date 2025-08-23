@@ -36,6 +36,15 @@ from db import Base, engine, AsyncSessionLocal
 from db_models import User, Company
 import crud
 
+# --- Python 3.13 event loop shim ---
+import asyncio as _asyncio
+try:
+    _asyncio.get_event_loop()
+except RuntimeError:
+    _loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(_loop)
+# -----------------------------------
+
 
 # =========================
 # CONFIG / CONSTANTS
