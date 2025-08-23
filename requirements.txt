@@ -2,3 +2,5 @@ python-telegram-bot==20.3
 httpx
 tgcrypto
 Pillow
+SQLAlchemy==2.0.21
+alembic
