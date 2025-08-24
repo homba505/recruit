@@ -499,60 +499,118 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---- ADMIN PANEL ----
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        await update.effective_chat.send_message("Admins only.")
-        return
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Users", callback_data="admin:users"),
-         InlineKeyboardButton("🏢 Companies", callback_data="admin:companies")],
-        [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
-         InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
-    ])
-    await update.effective_chat.send_message("Admin panel:", reply_markup=kb)
-
-
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    sub = q.data.split(":")[1]
-    if sub == "users":
-        users = await crud.list_users()
-        lines = [f"{u.id}. {u.username} ({u.role}) {'✅' if u.is_active else '❌'}" for u in users]
-        text = "👤 <b>Users</b>\n" + ("\n".join(lines) or "No users")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add", callback_data="user:add"),
-             InlineKeyboardButton("♻️ Toggle Active", callback_data="user:toggle"),
-             InlineKeyboardButton("✏️ Rename", callback_data="user:rename")],
-            [InlineKeyboardButton("🔑 Change Password", callback_data="user:pass"),
-             InlineKeyboardButton("🗑 Delete", callback_data="user:del")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
-        ])
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    elif sub == "companies":
-        companies = await crud.list_companies()
-        lines = [f"{c.id}. {c.name} — <code>{c.telegram_chat_id}</code>" for c in companies]
-        text = "🏢 <b>Companies</b>\n" + ("\n".join(lines) or "No companies")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add", callback_data="co:add"),
-             InlineKeyboardButton("✏️ Rename", callback_data="co:rename")],
-            [InlineKeyboardButton("🔁 Change Chat ID", callback_data="co:chat"),
-             InlineKeyboardButton("🗑 Delete", callback_data="co:del")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
-        ])
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    data = q.data  # e.g. "admin:users", "user:add", "co:chat"
+    parts = data.split(":", 1)
+    head = parts[0]                  # "admin" | "user" | "co"
+    tail = parts[1] if len(parts) > 1 else ""
 
-    elif sub == "leaderboard":
-        await send_leaderboard_now(update, context, edit=True)
+    # ----- MAIN ADMIN MENU ACTIONS -----
+    if head == "admin":
+        sub = tail
+        if sub == "users":
+            users = await crud.list_users()
+            lines = [f"{u.id}. {u.username} ({u.role}) {'✅' if u.is_active else '❌'}" for u in users]
+            text = "👤 <b>Users</b>\n" + ("\n".join(lines) or "No users")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add", callback_data="user:add"),
+                 InlineKeyboardButton("♻️ Toggle Active", callback_data="user:toggle"),
+                 InlineKeyboardButton("✏️ Rename", callback_data="user:rename")],
+                [InlineKeyboardButton("🔑 Change Password", callback_data="user:pass"),
+                 InlineKeyboardButton("🗑 Delete", callback_data="user:del")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
+            ])
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    elif sub == "report":
-        await send_report_now(update, context, edit=True)
+        elif sub == "companies":
+            companies = await crud.list_companies()
+            lines = [f"{c.id}. {c.name} — <code>{c.telegram_chat_id}</code>" for c in companies]
+            text = "🏢 <b>Companies</b>\n" + ("\n".join(lines) or "No companies")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add", callback_data="co:add"),
+                 InlineKeyboardButton("✏️ Rename", callback_data="co:rename")],
+                [InlineKeyboardButton("🔁 Change Chat ID", callback_data="co:chat"),
+                 InlineKeyboardButton("🗑 Delete", callback_data="co:del")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
+            ])
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    elif sub == "back":
-        await admin_menu(update, context)
+        elif sub == "leaderboard":
+            await send_leaderboard_now(update, context, edit=True)
+
+        elif sub == "report":
+            await send_report_now(update, context, edit=True)
+
+        elif sub == "back":
+            await admin_menu(update, context)
+
+        return
+
+    # ----- USER ACTION BUTTONS → SHOW HOW-TO COMMANDS -----
+    if head == "user":
+        action = tail
+        if action == "add":
+            await q.edit_message_text(
+                "➕ To add a user:\n<code>/add_user &lt;username&gt; &lt;password&gt; [role]</code>\n\n"
+                "Example:\n<code>/add_user Ali secret123 recruiter</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "toggle":
+            await q.edit_message_text(
+                "♻️ Toggle active status:\n(no inline flow yet)\nUse SQL or add a quick command if needed.",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "rename":
+            await q.edit_message_text(
+                "✏️ Rename user:\n<code>/rename_user &lt;user_id&gt; &lt;new_username&gt;</code>\n\n"
+                "Example:\n<code>/rename_user 3 AliNew</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "pass":
+            await q.edit_message_text(
+                "🔑 Change password:\n<code>/set_pass &lt;user_id&gt; &lt;new_password&gt;</code>\n\n"
+                "Example:\n<code>/set_pass 3 newP@ss</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "del":
+            await q.edit_message_text(
+                "🗑 Delete user:\n<code>/del_user &lt;user_id&gt;</code>\n\n"
+                "Example:\n<code>/del_user 3</code>",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    # ----- COMPANY ACTION BUTTONS → SHOW HOW-TO COMMANDS -----
+    if head == "co":
+        action = tail
+        if action == "add":
+            await q.edit_message_text(
+                "➕ Add company:\n<code>/add_company &lt;name&gt; &lt;chat_id&gt;</code>\n\n"
+                "Example:\n<code>/add_company SwiftTrucking -1001234567890</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "rename":
+            await q.edit_message_text(
+                "✏️ Rename company:\n<code>/rename_company &lt;company_id&gt; &lt;new_name&gt;</code>\n\n"
+                "Example:\n<code>/rename_company 2 UltraLogistics</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "chat":
+            await q.edit_message_text(
+                "🔁 Change company chat:\n<code>/set_company_chat &lt;company_id&gt; &lt;chat_id&gt;</code>\n\n"
+                "Example:\n<code>/set_company_chat 2 -1001234567890</code>",
+                parse_mode=ParseMode.HTML
+            )
+        elif action == "del":
+            await q.edit_message_text(
+                "🗑 Delete company:\n<code>/del_company &lt;company_id&gt;</code>\n\n"
+                "Example:\n<code>/del_company 2</code>",
+                parse_mode=ParseMode.HTML
+            )
+        return
 
 
 # Minimal, interactive admin input flows (quick & simple via /command arguments)
@@ -661,6 +719,28 @@ async def send_report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, ed
     else:
         await update.effective_chat.send_message(text)
 
+# ---- HELP ----
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+<b>HOMBA Recruit Bot – Commands</b>
+
+👤 Recruiters:
+  /start – begin / login
+  /new – submit a new driver
+
+👮 Admins:
+  /admin – open Admin Panel
+  /add_user <username> <password> [role]
+  /rename_user <user_id> <new_username>
+  /set_pass <user_id> <new_password>
+  /del_user <user_id>
+  /add_company <name> <chat_id>
+  /rename_company <company_id> <new_name>
+  /set_company_chat <company_id> <chat_id>
+  /del_company <company_id>
+"""
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
 
 # =========================
 # STARTUP (single, Python 3.12/3.13-safe)
@@ -720,6 +800,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("rename_company", rename_company_cmd))
     app.add_handler(CommandHandler("set_company_chat", company_chat_cmd))
     app.add_handler(CommandHandler("del_company", del_company_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
 
     return app
 
