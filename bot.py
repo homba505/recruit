@@ -36,90 +36,6 @@ from db import Base, engine, AsyncSessionLocal
 from db_models import User, Company
 import crud
 
-# ========= Python 3.13-safe startup (drop-in) =========
-import asyncio
-import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder
-
-async def _build_app():
-    """
-    Build your Application and add handlers.
-    We don’t touch your existing functions/handlers; we just add them if present.
-    """
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN / BOT_TOKEN is not set in environment")
-
-    app = ApplicationBuilder().token(token).build()
-
-    # Add your existing handlers safely if they are defined in this file.
-    # (No NameError if some aren’t present.)
-    for name in [
-        # conversation handlers you showed in logs
-        "login_conv",
-        "new_conv",
-        # typical command/text/callback handlers you likely have
-        "start_handler",
-        "help_handler",
-        "on_text_handler",
-        "on_photo_handler",
-        "on_document_handler",
-        "callback_handler",
-        # anything else you defined above
-        "admin_panel_handler",
-        "company_admin_handler",
-        "recruiter_admin_handler",
-        "pdf_preview_handler",
-        "weekly_report_handler",
-    ]:
-        handler = globals().get(name)
-        if handler is not None:
-            app.add_handler(handler)
-
-    # If you didn’t wrap your functions in Handler objects and instead used
-    # plain functions like: start, on_text, on_callback, etc.,
-    # ALSO try to attach the common ones below if you exposed ready-made handlers:
-    # (Uncomment if needed)
-    # from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
-    # if globals().get("start"):
-    #     app.add_handler(CommandHandler("start", start))
-    # if globals().get("help"):
-    #     app.add_handler(CommandHandler("help", help))
-    # if globals().get("on_text"):
-    #     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    # if globals().get("on_callback"):
-    #     app.add_handler(CallbackQueryHandler(on_callback))
-
-    return app
-
-
-async def main():
-    """
-    Python 3.13 compatible lifecycle:
-    initialize -> start -> updater.start_polling -> wait -> stop -> shutdown
-    """
-    app = await _build_app()
-
-    # Initialize and start
-    await app.initialize()
-    await app.start()
-
-    # Start polling and wait until stopped
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    try:
-        await app.updater.wait()
-    finally:
-        # Graceful shutdown
-        await app.stop()
-        await app.shutdown()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-# ======================================================
-
-
 
 # =========================
 # CONFIG / CONSTANTS
@@ -747,9 +663,10 @@ async def send_report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, ed
 
 
 # =========================
-# MAIN
+# STARTUP (single, Python 3.12/3.13-safe)
 # =========================
-def build_application() -> Application:
+def _build_app() -> Application:
+    # Build app with the configured token
     app = Application.builder().token(BOT_TOKEN).build()
 
     # /start + /login
@@ -807,12 +724,24 @@ def build_application() -> Application:
     return app
 
 
-def main():
-    app = build_application()
-    # PTB 21: this blocks and manages the loop correctly
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+async def main():
+    # Ensure tables exist and default admin is present
+    await seed_bootstrap()
+
+    app = _build_app()
+
+    # Explicit 3.12/3.13-safe lifecycle
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Run forever
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(seed_bootstrap())
-    main()
+    asyncio.run(main())
