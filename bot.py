@@ -1,14 +1,10 @@
 # bot.py
 import asyncio
-import io
 import os
 import textwrap
-from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Tuple
 
-from PIL import Image
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,14 +36,15 @@ import crud
 # =========================
 # CONFIG / CONSTANTS
 # =========================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "7347942497:AAEe8ErXDQ3nA0anVgn1q8uGHrPrq5HQPwU"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-# Admin bootstrap (will be created if not present)
 DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "HOMBA")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fayzo2008")
 
-LOGO_PATH = os.getenv("LOGO_PATH", "homba_logo.png")  # put your logo file into repo beside bot.py
-PDF_DIR = os.getenv("PDF_DIR", "pdf_out")             # where PDFs will be saved locally on Render
+LOGO_PATH = os.getenv("LOGO_PATH", "homba_logo.png")  # optional logo beside bot.py
+PDF_DIR = os.getenv("PDF_DIR", "pdf_out")             # where PDFs are written
 
 
 # =========================
@@ -68,22 +65,20 @@ PDF_DIR = os.getenv("PDF_DIR", "pdf_out")             # where PDFs will be saved
 ) = range(11)
 
 
-# Runtime memory for chat sessions (who is logged in)
-SESSIONS: Dict[int, int] = {}  # chat_id -> user_id
-
-# Temp buffers for building a driver application per chat
-NEW_APP: Dict[int, Dict] = {}
+# sessions & temp buffers
+SESSIONS: Dict[int, int] = {}               # chat_id -> user_id
+NEW_APP: Dict[int, Dict] = {}               # per-chat draft application
 
 
 # =========================
-# UTIL
+# UTIL & BOOTSTRAP
 # =========================
 async def get_db_session() -> AsyncSession:
     return AsyncSessionLocal()  # type: ignore
 
 
 async def seed_bootstrap() -> None:
-    """Create tables and ensure an admin user exists."""
+    """Create tables and ensure default admin exists."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -114,7 +109,7 @@ async def require_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Opti
 
 
 # =========================
-# PDF GENERATION
+# PDF GENERATION (2 pages)
 # =========================
 async def generate_driver_pdf(
     driver_id: int,
@@ -128,8 +123,8 @@ async def generate_driver_pdf(
     bot_context: ContextTypes.DEFAULT_TYPE,
 ) -> str:
     """
-    Page 1: summary + logo header
-    Page 2: CDL + Medical card (original quality)
+    Page 1: summary header
+    Page 2: CDL + Medical (full width)
     """
     ensure_pdf_dir()
     pdf_path = os.path.join(PDF_DIR, f"driver_{driver_id}.pdf")
@@ -137,24 +132,19 @@ async def generate_driver_pdf(
     c = canvas.Canvas(pdf_path, pagesize=A4)
     W, H = A4
 
-    # Header strip
-    c.setFillColorRGB(0.066, 0.285, 0.43)  # HOMBA blue bar
+    # Header bar
+    c.setFillColorRGB(0.066, 0.285, 0.43)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
 
-    # Logo
-    if os.path.exists(LOGO_PATH):
-        try:
-            c.drawImage(LOGO_PATH, 25, H - 65, width=120, height=60, preserveAspectRatio=True, mask='auto')
-        except Exception:
-            pass
-
+    # Title
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 22)
-    c.drawString(160, H - 40, "HOMBA — Driver Application")
+    c.drawString(30, H - 40, "HOMBA — Driver Application")
 
     # Body
     c.setFillColorRGB(0, 0, 0)
-    y = H - 100
+    c.setFont("Helvetica", 12)
+    y = H - 110
     left = 40
 
     def line(lbl: str, val: str):
@@ -165,7 +155,7 @@ async def generate_driver_pdf(
         c.drawString(left + 170, y, val)
         y -= 24
 
-    line("Application Type:", kind.upper())
+    line("Application Type:", (kind or "").upper())
     line("Driver Name:", clean_text(name))
     line("Phone:", clean_text(phone))
     line("Experience (months):", str(exp_months) if exp_months is not None else "—")
@@ -173,17 +163,11 @@ async def generate_driver_pdf(
     line("Ready Date:", clean_text(ready_date))
     y -= 6
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(left, y, "Support: @andrew5833   •   Generated automatically by HOMBA Bot")
+    c.drawString(left, y, "Generated automatically by HOMBA Recruit Bot")
     c.showPage()
 
-    # Page 2 — images
-    def draw_image_center(img_path: str, y_top: float, height: float):
-        try:
-            c.drawImage(img_path, 40, y_top - height, width=W - 80, height=height, preserveAspectRatio=True, mask='auto')
-        except Exception:
-            pass
-
-    # Download files first (if present)
+    # Page 2 — docs
+    # Download files to temp
     tmp_files: list[str] = []
     for fid in [file_ids[0], file_ids[1]]:
         if not fid:
@@ -197,13 +181,17 @@ async def generate_driver_pdf(
         except Exception:
             tmp_files.append("")
 
-    # Title
     c.setFont("Helvetica-Bold", 16)
     c.drawString(40, H - 60, "Documents")
     c.setFont("Helvetica", 12)
-    c.drawString(40, H - 80, "CDL and Medical Card (full quality)")
+    c.drawString(40, H - 80, "CDL and Medical Card")
 
-    # Images stacked
+    def draw_image_center(img_path: str, y_top: float, height: float):
+        try:
+            c.drawImage(img_path, 40, y_top - height, width=W - 80, height=height, preserveAspectRatio=True, mask='auto')
+        except Exception:
+            pass
+
     top = H - 110
     each_height = (H - 160) / 2
     if tmp_files[0]:
@@ -243,6 +231,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---- LOGIN ----
 async def cb_login_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -342,7 +331,6 @@ async def take_ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def take_file1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     fid = None
-
     if update.message.photo:
         fid = update.message.photo[-1].file_id
         t = "photo"
@@ -362,7 +350,6 @@ async def take_file1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def take_file2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     fid = None
-
     if update.message.photo:
         fid = update.message.photo[-1].file_id
         t = "photo"
@@ -382,9 +369,7 @@ async def take_file2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No companies configured. Ask admin to add one in /admin.")
         return ConversationHandler.END
 
-    rows = []
-    for c in companies:
-        rows.append([InlineKeyboardButton(f"{c.id}. {c.name}", callback_data=f"pickco:{c.id}")])
+    rows = [[InlineKeyboardButton(f"{c.id}. {c.name}", callback_data=f"pickco:{c.id}")] for c in companies]
     await update.message.reply_text("Pick a company to post to:", reply_markup=InlineKeyboardMarkup(rows))
     return S_PICK_COMPANY
 
@@ -405,7 +390,6 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     d = NEW_APP.get(chat_id, {})
-    # persist driver
     file_types = f"{d.get('file_types_1','')},{d.get('file_types_2','')}"
     file_ids = f"{d['file_ids'][0] or ''}|{d['file_ids'][1] or ''}"
 
@@ -421,7 +405,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_ids=file_ids,
     )
 
-    # compose text
+    # compose & send
     text_msg = textwrap.dedent(f"""
         <b>New driver application</b>
 
@@ -433,7 +417,6 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         <b>Ready date:</b> {d.get('ready_date') or '—'}
     """).strip()
 
-    # 1) send text
     try:
         sent = await context.bot.send_message(
             chat_id=int(company.telegram_chat_id),
@@ -445,7 +428,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Failed to post to company group: {e.message}")
         return ConversationHandler.END
 
-    # 2) re-send original files (keep your original behavior)
+    # send media
     media = []
     fid1, fid2 = d["file_ids"]
     if fid1:
@@ -456,20 +439,14 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_media_group(chat_id=int(company.telegram_chat_id), media=media)
         except BadRequest:
-            # fallback send separately
             if fid1:
-                try:
-                    await context.bot.send_photo(int(company.telegram_chat_id), fid1, caption="CDL")
-                except Exception:
-                    pass
+                try: await context.bot.send_photo(int(company.telegram_chat_id), fid1, caption="CDL")
+                except Exception: pass
             if fid2:
-                try:
-                    await context.bot.send_photo(int(company.telegram_chat_id), fid2, caption="Medical Card")
-                except Exception:
-                    pass
+                try: await context.bot.send_photo(int(company.telegram_chat_id), fid2, caption="Medical Card")
+                except Exception: pass
 
-    # 3) also send the PDF
-    file_ids_tuple = (fid1, fid2)
+    # send PDF
     pdf_path = await generate_driver_pdf(
         driver_id=driver_id,
         kind=d["kind"],
@@ -478,7 +455,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_months=d.get("exp_months"),
         escrow=d.get("escrow"),
         ready_date=d.get("ready_date"),
-        file_ids=file_ids_tuple,
+        file_ids=(fid1, fid2),
         bot_context=context,
     )
     await crud.save_pdf(driver_id, pdf_path)
@@ -499,16 +476,31 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---- ADMIN PANEL ----
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await require_user(context, update.effective_chat.id)
+    if not u or u.role != "admin":
+        await update.effective_chat.send_message("Admins only.")
+        return
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Users", callback_data="admin:users"),
+         InlineKeyboardButton("🏢 Companies", callback_data="admin:companies")],
+        [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
+         InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
+    ])
+    await update.effective_chat.send_message("Admin panel:", reply_markup=kb)
+
+
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    data = q.data  # e.g. "admin:users", "user:add", "co:chat"
+    data = q.data               # e.g. "admin:users", "user:add", "co:chat"
     parts = data.split(":", 1)
-    head = parts[0]                  # "admin" | "user" | "co"
+    head = parts[0]
     tail = parts[1] if len(parts) > 1 else ""
 
-    # ----- MAIN ADMIN MENU ACTIONS -----
+    # MAIN ADMIN MENU
     if head == "admin":
         sub = tail
         if sub == "users":
@@ -549,7 +541,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ----- USER ACTION BUTTONS → SHOW HOW-TO COMMANDS -----
+    # USER ACTION BUTTONS -> reply with slash-command guide
     if head == "user":
         action = tail
         if action == "add":
@@ -583,7 +575,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ----- COMPANY ACTION BUTTONS → SHOW HOW-TO COMMANDS -----
+    # COMPANY ACTION BUTTONS -> reply with slash-command guide
     if head == "co":
         action = tail
         if action == "add":
@@ -613,7 +605,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# Minimal, interactive admin input flows (quick & simple via /command arguments)
+# ---- ADMIN QUICK COMMANDS ----
 async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u or u.role != "admin":
@@ -719,7 +711,8 @@ async def send_report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, ed
     else:
         await update.effective_chat.send_message(text)
 
-# ---- HELP ----
+
+# ---- HELP & UNKNOWN ----
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = """
 <b>HOMBA Recruit Bot – Commands</b>
@@ -742,15 +735,32 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("Unknown command. Type /help for the list.")
+
+
 # =========================
 # STARTUP (single, Python 3.12/3.13-safe)
 # =========================
 def _build_app() -> Application:
-    # Build app with the configured token
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # /start + /login
+    # commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("admin", admin_menu))
+
+    app.add_handler(CommandHandler("add_user", add_user_cmd))
+    app.add_handler(CommandHandler("rename_user", rename_user_cmd))
+    app.add_handler(CommandHandler("set_pass", pass_user_cmd))
+    app.add_handler(CommandHandler("del_user", del_user_cmd))
+
+    app.add_handler(CommandHandler("add_company", add_company_cmd))
+    app.add_handler(CommandHandler("rename_company", rename_company_cmd))
+    app.add_handler(CommandHandler("set_company_chat", company_chat_cmd))
+    app.add_handler(CommandHandler("del_company", del_company_cmd))
+
+    # login flow
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_login_button, pattern="^login$")],
         states={
@@ -764,7 +774,7 @@ def _build_app() -> Application:
     )
     app.add_handler(login_conv)
 
-    # /new flow
+    # new driver flow
     new_conv = ConversationHandler(
         entry_points=[CommandHandler("new", cmd_new)],
         states={
@@ -785,38 +795,19 @@ def _build_app() -> Application:
     )
     app.add_handler(new_conv)
 
-    # Admin
-    app.add_handler(CommandHandler("admin", admin_menu))
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:.*$"))
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^(user|co):.*$"))
-
-    # Admin quick commands (easier to operate)
-    app.add_handler(CommandHandler("add_user", add_user_cmd))
-    app.add_handler(CommandHandler("rename_user", rename_user_cmd))
-    app.add_handler(CommandHandler("set_pass", pass_user_cmd))
-    app.add_handler(CommandHandler("del_user", del_user_cmd))
-
-    app.add_handler(CommandHandler("add_company", add_company_cmd))
-    app.add_handler(CommandHandler("rename_company", rename_company_cmd))
-    app.add_handler(CommandHandler("set_company_chat", company_chat_cmd))
-    app.add_handler(CommandHandler("del_company", del_company_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
+    # unknown commands (keep last)
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
     return app
 
 
 async def main():
-    # Ensure tables exist and default admin is present
     await seed_bootstrap()
-
     app = _build_app()
-
-    # Explicit 3.12/3.13-safe lifecycle
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     try:
-        # Run forever
         await asyncio.Event().wait()
     finally:
         await app.updater.stop()
