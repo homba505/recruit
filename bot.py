@@ -798,7 +798,7 @@ def _build_app() -> Application:
     # unknown commands (keep last)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r^(admin|user|co):)")
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^(admin|user|co):)")
 
 
     return app
