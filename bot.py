@@ -1,13 +1,12 @@
 # bot.py
 import asyncio
 import os
+import re
 import textwrap
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from telegram import (
     Update,
@@ -16,6 +15,7 @@ from telegram import (
     InputMediaPhoto,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -26,15 +26,13 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
 
-from db import Base, engine, AsyncSessionLocal
+from db import Base, engine
 from db_models import User, Company
 import crud
 
-
 # =========================
-# CONFIG / CONSTANTS
+# CONFIG
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
@@ -43,12 +41,10 @@ if not BOT_TOKEN:
 DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "HOMBA")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fayzo2008")
 
-LOGO_PATH = os.getenv("LOGO_PATH", "homba_logo.png")  # optional logo beside bot.py
-PDF_DIR = os.getenv("PDF_DIR", "pdf_out")             # where PDFs are written
-
+PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
 
 # =========================
-# STATE MACHINE
+# STATES
 # =========================
 (
     S_LOGIN_USERNAME,
@@ -64,52 +60,32 @@ PDF_DIR = os.getenv("PDF_DIR", "pdf_out")             # where PDFs are written
     S_PICK_COMPANY,
 ) = range(11)
 
-
-# sessions & temp buffers
-SESSIONS: Dict[int, int] = {}               # chat_id -> user_id
-NEW_APP: Dict[int, Dict] = {}               # per-chat draft application
-
-
-# =========================
-# UTIL & BOOTSTRAP
-# =========================
-async def get_db_session() -> AsyncSession:
-    return AsyncSessionLocal()  # type: ignore
-
-
-async def seed_bootstrap() -> None:
-    """Create tables and ensure default admin exists."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    admin = await crud.get_user_by_username(DEFAULT_ADMIN_USERNAME)
-    if not admin:
-        await crud.create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, role="admin")
-
-
-def need_login() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]])
-
+# sessions & temp
+SESSIONS: Dict[int, int] = {}         # chat_id -> user_id
+NEW_APP: Dict[int, Dict] = {}         # per-chat draft app
 
 def ensure_pdf_dir():
     os.makedirs(PDF_DIR, exist_ok=True)
 
+def need_login() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]])
 
-def clean_text(s: Optional[str]) -> str:
-    return s or "—"
-
+async def seed_bootstrap() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # ensure default admin exists
+    admin = await crud.get_user_by_username(DEFAULT_ADMIN_USERNAME)
+    if not admin:
+        await crud.create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, role="admin")
 
 async def require_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[User]:
-    user_id = SESSIONS.get(chat_id)
-    if not user_id:
+    uid = SESSIONS.get(chat_id)
+    if not uid:
         return None
-    async with await get_db_session() as s:
-        u = await s.get(User, user_id)
-        return u
-
+    return await crud.get_user(uid)
 
 # =========================
-# PDF GENERATION (2 pages)
+# PDF generation
 # =========================
 async def generate_driver_pdf(
     driver_id: int,
@@ -122,26 +98,19 @@ async def generate_driver_pdf(
     file_ids: Tuple[Optional[str], Optional[str]],
     bot_context: ContextTypes.DEFAULT_TYPE,
 ) -> str:
-    """
-    Page 1: summary header
-    Page 2: CDL + Medical (full width)
-    """
     ensure_pdf_dir()
     pdf_path = os.path.join(PDF_DIR, f"driver_{driver_id}.pdf")
 
     c = canvas.Canvas(pdf_path, pagesize=A4)
     W, H = A4
 
-    # Header bar
+    # Header
     c.setFillColorRGB(0.066, 0.285, 0.43)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
-
-    # Title
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 22)
     c.drawString(30, H - 40, "HOMBA — Driver Application")
 
-    # Body
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica", 12)
     y = H - 110
@@ -156,19 +125,18 @@ async def generate_driver_pdf(
         y -= 24
 
     line("Application Type:", (kind or "").upper())
-    line("Driver Name:", clean_text(name))
-    line("Phone:", clean_text(phone))
+    line("Driver Name:", name or "—")
+    line("Phone:", phone or "—")
     line("Experience (months):", str(exp_months) if exp_months is not None else "—")
-    line("Escrow:", clean_text(escrow))
-    line("Ready Date:", clean_text(ready_date))
+    line("Escrow:", escrow or "—")
+    line("Ready Date:", ready_date or "—")
     y -= 6
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(left, y, "Generated automatically by HOMBA Recruit Bot")
     c.showPage()
 
-    # Page 2 — docs
-    # Download files to temp
-    tmp_files: list[str] = []
+    # Page 2: docs
+    tmp_files: List[str] = []
     for fid in [file_ids[0], file_ids[1]]:
         if not fid:
             tmp_files.append("")
@@ -202,19 +170,15 @@ async def generate_driver_pdf(
     c.showPage()
     c.save()
 
-    # cleanup temp
     for p in tmp_files:
         if p and os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+            try: os.remove(p)
+            except Exception: pass
 
     return pdf_path
 
-
 # =========================
-# COMMANDS & FLOWS
+# Commands & flows
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await seed_bootstrap()
@@ -222,14 +186,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, chat_id)
     if u:
         await update.effective_chat.send_message(
-            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins: /admin"
+            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins/HR: /admin"
         )
     else:
         await update.effective_chat.send_message(
             "Welcome to HOMBA Recruit Bot!\nPlease log in to continue.",
             reply_markup=need_login(),
         )
-
 
 # ---- LOGIN ----
 async def cb_login_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,29 +201,26 @@ async def cb_login_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Enter username:")
     return S_LOGIN_USERNAME
 
-
 async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["login_username"] = update.message.text.strip()
     await update.message.reply_text("Enter password:")
     return S_LOGIN_PASSWORD
-
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uname = context.user_data.get("login_username")
     pwd = update.message.text.strip()
 
     user = await crud.get_user_by_username(uname)
-    if not user or user.password_hash != pwd or not user.is_active:
+    # bcrypt verification + active
+    if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
         await update.message.reply_text("❌ Invalid credentials or inactive user.")
         return ConversationHandler.END
 
-    # bind telegram id
     await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
     SESSIONS[update.effective_chat.id] = user.id
 
     await update.message.reply_text(f"✅ Logged in as {user.username}. Use /new to submit a driver.")
     return ConversationHandler.END
-
 
 # ---- NEW DRIVER ----
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,7 +230,6 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     NEW_APP[update.effective_chat.id] = {"kind": None, "file_ids": [None, None]}
-
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("SOLO", callback_data="kind:solo"),
          InlineKeyboardButton("TEAM", callback_data="kind:team"),
@@ -278,7 +237,6 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.effective_chat.send_message("Choose application type:", reply_markup=kb)
     return S_NEW_KIND
-
 
 async def cb_pick_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -289,20 +247,17 @@ async def cb_pick_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"Type selected: {kind.upper()}\n\nDriver name?")
     return S_NEW_NAME
 
-
 async def take_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     NEW_APP[chat_id]["name"] = update.message.text.strip()
     await update.message.reply_text("Phone number?")
     return S_NEW_PHONE
 
-
 async def take_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     NEW_APP[chat_id]["phone"] = update.message.text.strip()
     await update.message.reply_text("Experience in months? (send number or '-' )")
     return S_NEW_EXP
-
 
 async def take_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -311,7 +266,6 @@ async def take_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Escrow? (or '-')")
     return S_NEW_ESCROW
 
-
 async def take_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     t = update.message.text.strip()
@@ -319,14 +273,12 @@ async def take_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ready date? (or '-')")
     return S_NEW_READYDATE
 
-
 async def take_ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     t = update.message.text.strip()
     NEW_APP[chat_id]["ready_date"] = None if t == "-" else t
     await update.message.reply_text("Send CDL photo/document")
     return S_NEW_FILE1
-
 
 async def take_file1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -345,7 +297,6 @@ async def take_file1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     NEW_APP[chat_id]["file_types_1"] = t
     await update.message.reply_text("Now send MEDICAL CARD photo/document")
     return S_NEW_FILE2
-
 
 async def take_file2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -372,7 +323,6 @@ async def take_file2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = [[InlineKeyboardButton(f"{c.id}. {c.name}", callback_data=f"pickco:{c.id}")] for c in companies]
     await update.message.reply_text("Pick a company to post to:", reply_markup=InlineKeyboardMarkup(rows))
     return S_PICK_COMPANY
-
 
 async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -403,9 +353,11 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ready_date=d.get("ready_date"),
         file_types=file_types,
         file_ids=file_ids,
+        company_id=company.id,
+        company_chat_id=company.telegram_chat_id,
     )
 
-    # compose & send
+    # compose & send (include Ref)
     text_msg = textwrap.dedent(f"""
         <b>New driver application</b>
 
@@ -415,6 +367,8 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         <b>Experience (months):</b> {d.get('exp_months') if d.get('exp_months') is not None else '—'}
         <b>Escrow:</b> {d.get('escrow') or '—'}
         <b>Ready date:</b> {d.get('ready_date') or '—'}
+
+        Ref: <code>#D{driver_id}</code>
     """).strip()
 
     try:
@@ -439,6 +393,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_media_group(chat_id=int(company.telegram_chat_id), media=media)
         except BadRequest:
+            # fallback one by one
             if fid1:
                 try: await context.bot.send_photo(int(company.telegram_chat_id), fid1, caption="CDL")
                 except Exception: pass
@@ -465,7 +420,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=int(company.telegram_chat_id),
             document=open(pdf_path, "rb"),
             filename=os.path.basename(pdf_path),
-            caption="Driver Summary (PDF)",
+            caption=f"Driver Summary (PDF) — Ref #D{driver_id}",
         )
     except Exception:
         pass
@@ -474,50 +429,78 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     NEW_APP.pop(chat_id, None)
     return ConversationHandler.END
 
-
 # ---- ADMIN PANEL ----
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        await update.effective_chat.send_message("Admins only.")
+    if not u:
         return
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Users", callback_data="admin:users"),
-         InlineKeyboardButton("🏢 Companies", callback_data="admin:companies")],
-        [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
-         InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
-    ])
+    if u.role == "admin":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 Users", callback_data="admin:users"),
+             InlineKeyboardButton("🏢 Companies", callback_data="admin:companies")],
+            [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
+             InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
+        ])
+    elif u.role == "hr_manager":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 Users", callback_data="admin:users")],
+            [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
+             InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
+        ])
+    else:
+        await update.effective_chat.send_message("Admins/HR only.")
+        return
     await update.effective_chat.send_message("Admin panel:", reply_markup=kb)
-
 
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    data = q.data               # e.g. "admin:users", "user:add", "co:chat"
+    data = q.data
     parts = data.split(":", 1)
     head = parts[0]
     tail = parts[1] if len(parts) > 1 else ""
 
-    # MAIN ADMIN MENU
+    # who
+    chat_id = q.message.chat_id
+    me = await require_user(context, chat_id)
+    if not me:
+        await q.edit_message_text("You need to log in.", reply_markup=need_login())
+        return
+
     if head == "admin":
         sub = tail
         if sub == "users":
-            users = await crud.list_users()
-            lines = [f"{u.id}. {u.username} ({u.role}) {'✅' if u.is_active else '❌'}" for u in users]
-            text = "👤 <b>Users</b>\n" + ("\n".join(lines) or "No users")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Add", callback_data="user:add"),
-                 InlineKeyboardButton("♻️ Toggle Active", callback_data="user:toggle"),
-                 InlineKeyboardButton("✏️ Rename", callback_data="user:rename")],
-                [InlineKeyboardButton("🔑 Change Password", callback_data="user:pass"),
-                 InlineKeyboardButton("🗑 Delete", callback_data="user:del")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
-            ])
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            if me.role == "admin":
+                users = await crud.list_users()
+                lines = [f"{u.id}. {u.username} ({u.role}) {'✅' if u.is_active else '❌'}" for u in users]
+                text = "👤 <b>Users</b>\n" + ("\n".join(lines) or "No users")
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add", callback_data="user:add"),
+                     InlineKeyboardButton("♻️ Toggle Active", callback_data="user:toggle"),
+                     InlineKeyboardButton("✏️ Rename", callback_data="user:rename")],
+                    [InlineKeyboardButton("🔑 Change Password", callback_data="user:pass"),
+                     InlineKeyboardButton("🗑 Delete", callback_data="user:del")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
+                ])
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                # HR: list only team
+                users = await crud.list_team(me.id)
+                lines = [f"{u.id}. {u.username} ({'✅' if u.is_active else '❌'})" for u in users]
+                text = "👤 <b>Your Team</b>\n" + ("\n".join(lines) or "No recruiters yet")
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add", callback_data="user:add"),
+                     InlineKeyboardButton("✏️ Rename", callback_data="user:rename")],
+                    [InlineKeyboardButton("🔑 Change Password", callback_data="user:pass")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
+                ])
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
 
-        elif sub == "companies":
+        if sub == "companies":
+            if me.role != "admin":
+                await q.edit_message_text("Admins only.")
+                return
             companies = await crud.list_companies()
             lines = [f"{c.id}. {c.name} — <code>{c.telegram_chat_id}</code>" for c in companies]
             text = "🏢 <b>Companies</b>\n" + ("\n".join(lines) or "No companies")
@@ -529,218 +512,334 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]
             ])
             await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
 
-        elif sub == "leaderboard":
-            await send_leaderboard_now(update, context, edit=True)
+        if sub == "leaderboard":
+            await send_leaderboard_now(update, context, edit=True); return
+        if sub == "report":
+            await send_report_now(update, context, edit=True); return
+        if sub == "back":
+            await admin_menu(update, context); return
 
-        elif sub == "report":
-            await send_report_now(update, context, edit=True)
-
-        elif sub == "back":
-            await admin_menu(update, context)
-
-        return
-
-    # USER ACTION BUTTONS -> reply with slash-command guide
+    # buttons show how-to commands (kept simple)
     if head == "user":
         action = tail
         if action == "add":
-            await q.edit_message_text(
-                "➕ To add a user:\n<code>/add_user &lt;username&gt; &lt;password&gt; [role]</code>\n\n"
-                "Example:\n<code>/add_user Ali secret123 recruiter</code>",
-                parse_mode=ParseMode.HTML
-            )
-        elif action == "toggle":
-            await q.edit_message_text(
-                "♻️ Toggle active status:\n(no inline flow yet)\nUse SQL or add a quick command if needed.",
-                parse_mode=ParseMode.HTML
-            )
+            hint = "HR: <code>/add_user &lt;username&gt; &lt;password&gt; recruiter</code>\nAdmin: add any role"
         elif action == "rename":
-            await q.edit_message_text(
-                "✏️ Rename user:\n<code>/rename_user &lt;user_id&gt; &lt;new_username&gt;</code>\n\n"
-                "Example:\n<code>/rename_user 3 AliNew</code>",
-                parse_mode=ParseMode.HTML
-            )
+            hint = "<code>/rename_user &lt;user_id&gt; &lt;new_username&gt;</code>"
         elif action == "pass":
-            await q.edit_message_text(
-                "🔑 Change password:\n<code>/set_pass &lt;user_id&gt; &lt;new_password&gt;</code>\n\n"
-                "Example:\n<code>/set_pass 3 newP@ss</code>",
-                parse_mode=ParseMode.HTML
-            )
+            hint = "<code>/set_pass &lt;user_id&gt; &lt;new_password&gt;</code>"
+        elif action == "toggle":
+            hint = "No inline toggle yet."
         elif action == "del":
-            await q.edit_message_text(
-                "🗑 Delete user:\n<code>/del_user &lt;user_id&gt;</code>\n\n"
-                "Example:\n<code>/del_user 3</code>",
-                parse_mode=ParseMode.HTML
-            )
-        return
+            hint = "Admin only: <code>/del_user &lt;user_id&gt;</code>"
+        else:
+            hint = "Unknown."
+        await q.edit_message_text(hint, parse_mode=ParseMode.HTML); return
 
-    # COMPANY ACTION BUTTONS -> reply with slash-command guide
     if head == "co":
+        if me.role != "admin":
+            await q.edit_message_text("Admins only."); return
         action = tail
         if action == "add":
-            await q.edit_message_text(
-                "➕ Add company:\n<code>/add_company &lt;name&gt; &lt;chat_id&gt;</code>\n\n"
-                "Example:\n<code>/add_company SwiftTrucking -1001234567890</code>",
-                parse_mode=ParseMode.HTML
-            )
+            text = "➕ Add company:\n<code>/add_company &lt;name&gt; &lt;chat_id&gt;</code>"
         elif action == "rename":
-            await q.edit_message_text(
-                "✏️ Rename company:\n<code>/rename_company &lt;company_id&gt; &lt;new_name&gt;</code>\n\n"
-                "Example:\n<code>/rename_company 2 UltraLogistics</code>",
-                parse_mode=ParseMode.HTML
-            )
+            text = "✏️ Rename company:\n<code>/rename_company &lt;company_id&gt; &lt;new_name&gt;</code>"
         elif action == "chat":
-            await q.edit_message_text(
-                "🔁 Change company chat:\n<code>/set_company_chat &lt;company_id&gt; &lt;chat_id&gt;</code>\n\n"
-                "Example:\n<code>/set_company_chat 2 -1001234567890</code>",
-                parse_mode=ParseMode.HTML
-            )
+            text = "🔁 Change company chat:\n<code>/set_company_chat &lt;company_id&gt; &lt;chat_id&gt;</code>"
         elif action == "del":
-            await q.edit_message_text(
-                "🗑 Delete company:\n<code>/del_company &lt;company_id&gt;</code>\n\n"
-                "Example:\n<code>/del_company 2</code>",
-                parse_mode=ParseMode.HTML
-            )
-        return
-
+            text = "🗑 Delete company:\n<code>/del_company &lt;company_id&gt;</code>"
+        else:
+            text = "Unknown."
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML); return
 
 # ---- ADMIN QUICK COMMANDS ----
 async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u: return
+
     if len(context.args) < 2:
         await update.effective_chat.send_message("Usage: /add_user <username> <password> [role]")
         return
-    role = context.args[2] if len(context.args) >= 3 else "recruiter"
-    ok, err = await crud.create_user(context.args[0], context.args[1], role=role)
-    await update.effective_chat.send_message("✅ Created" if ok else f"❌ {err or 'Failed'}")
 
+    req_role = context.args[2] if len(context.args) >= 3 else "recruiter"
+
+    if u.role == "admin":
+        ok, err = await crud.create_user(context.args[0], context.args[1], role=req_role, manager_id=None)
+        await update.effective_chat.send_message("✅ Created" if ok else f"❌ {err or 'Failed'}")
+        return
+
+    if u.role == "hr_manager":
+        if req_role != "recruiter":
+            await update.effective_chat.send_message("HR Managers can only create recruiters.")
+            return
+        ok, err = await crud.create_user(context.args[0], context.args[1], role="recruiter", manager_id=u.id)
+        await update.effective_chat.send_message("✅ Recruiter created" if ok else f"❌ {err or 'Failed'}")
+        return
+
+    await update.effective_chat.send_message("You don't have permission to add users.")
 
 async def rename_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u: return
     if len(context.args) < 2:
         await update.effective_chat.send_message("Usage: /rename_user <user_id> <new_username>")
         return
-    ok, err = await crud.update_user_username(int(context.args[0]), context.args[1])
-    await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
+    target_id = int(context.args[0]); new_name = context.args[1]
 
+    if u.role == "admin":
+        ok, err = await crud.update_user_username(target_id, new_name)
+        await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
+        return
+
+    if u.role == "hr_manager":
+        if not await crud.is_in_team(u.id, target_id):
+            await update.effective_chat.send_message("You can only rename recruiters in your team."); return
+        ok, err = await crud.update_user_username(target_id, new_name)
+        await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
+        return
+
+    await update.effective_chat.send_message("You don't have permission to rename users.")
 
 async def pass_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u: return
     if len(context.args) < 2:
         await update.effective_chat.send_message("Usage: /set_pass <user_id> <new_password>")
         return
-    await crud.update_user_password(int(context.args[0]), context.args[1])
-    await update.effective_chat.send_message("✅ Password changed")
+    target_id = int(context.args[0]); new_pw = context.args[1]
 
+    if u.role == "admin":
+        await crud.update_user_password(target_id, new_pw)
+        await update.effective_chat.send_message("✅ Password changed"); return
+
+    if u.role == "hr_manager":
+        if not await crud.is_in_team(u.id, target_id):
+            await update.effective_chat.send_message("You can only change passwords for your team."); return
+        await crud.update_user_password(target_id, new_pw)
+        await update.effective_chat.send_message("✅ Password changed"); return
+
+    await update.effective_chat.send_message("You don't have permission to change passwords.")
 
 async def del_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u: return
     if not context.args:
-        await update.effective_chat.send_message("Usage: /del_user <user_id>")
-        return
+        await update.effective_chat.send_message("Usage: /del_user <user_id>"); return
+    if u.role != "admin":
+        await update.effective_chat.send_message("Only admins can delete users."); return
     await crud.delete_user(int(context.args[0]))
     await update.effective_chat.send_message("🗑 Deleted")
 
-
 async def add_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u or u.role != "admin": return
     if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /add_company <name> <chat_id>")
-        return
+        await update.effective_chat.send_message("Usage: /add_company <name> <chat_id>"); return
     ok, err = await crud.create_company(context.args[0], context.args[1])
     await update.effective_chat.send_message("✅ Added" if ok else f"❌ {err or 'Failed'}")
 
-
 async def rename_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u or u.role != "admin": return
     if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /rename_company <company_id> <new_name>")
-        return
+        await update.effective_chat.send_message("Usage: /rename_company <company_id> <new_name>"); return
     ok, err = await crud.rename_company(int(context.args[0]), context.args[1])
     await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
 
-
 async def company_chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u or u.role != "admin": return
     if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /set_company_chat <company_id> <chat_id>")
-        return
+        await update.effective_chat.send_message("Usage: /set_company_chat <company_id> <chat_id>"); return
     await crud.change_company_chat_id(int(context.args[0]), context.args[1])
     await update.effective_chat.send_message("🔁 Chat ID changed")
 
-
 async def del_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin":
-        return
+    if not u or u.role != "admin": return
     if not context.args:
-        await update.effective_chat.send_message("Usage: /del_company <company_id>")
-        return
+        await update.effective_chat.send_message("Usage: /del_company <company_id>"); return
     await crud.delete_company(int(context.args[0]))
     await update.effective_chat.send_message("🗑 Deleted")
 
-
-# ---- LEADERBOARD / REPORT (simple versions) ----
+# ---- LEADERBOARD / REPORT stubs ----
 async def send_leaderboard_now(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    text = "🏆 Recruiter Leaderboard (weekly)\n(coming from stored stats; basic version)"
-    if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text)
-    else:
-        await update.effective_chat.send_message(text)
-
+    text = "🏆 Recruiter Leaderboard (weekly)\n(placeholder)"
+    if edit and update.callback_query: await update.callback_query.edit_message_text(text)
+    else: await update.effective_chat.send_message(text)
 
 async def send_report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    text = "📊 Weekly Report sent. (basic placeholder — extend as needed)"
-    if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text)
+    text = "📊 Weekly Report sent. (placeholder)"
+    if edit and update.callback_query: await update.callback_query.edit_message_text(text)
+    else: await update.effective_chat.send_message(text)
+
+# ---- HR / Status / View ----
+VALID_STATUSES = {"approved", "waiting", "rejected"}
+
+async def my_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await require_user(context, update.effective_chat.id)
+    if not me or me.role != "hr_manager":
+        await update.effective_chat.send_message("Only HR Managers can view a team."); return
+    team = await crud.list_team(me.id)
+    if not team:
+        await update.effective_chat.send_message("Your team is empty. Use /add_user to create recruiters."); return
+    lines = [f"{u.id}. {u.username} ({'✅' if u.is_active else '❌'})" for u in team]
+    await update.effective_chat.send_message("👥 <b>Your Recruiters</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def set_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await require_user(context, update.effective_chat.id)
+    if not u:
+        return
+    if len(context.args) < 2:
+        await update.effective_chat.send_message("Usage: /set_status <driver_id> <approved|waiting|rejected>")
+        return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.effective_chat.send_message("Driver ID must be a number."); return
+    new_status = context.args[1].lower()
+    if new_status not in VALID_STATUSES:
+        await update.effective_chat.send_message("Status must be one of: approved, waiting, rejected"); return
+
+    d = await crud.find_driver_by_ref(driver_id)
+    if not d:
+        await update.effective_chat.send_message("Driver not found."); return
+
+    if u.role == "admin":
+        pass
+    elif u.role == "hr_manager":
+        recruiter = await crud.get_user(d.recruiter_id)
+        if not recruiter or recruiter.manager_id != u.id:
+            await update.effective_chat.send_message("You can only update status for your team's drivers.")
+            return
     else:
-        await update.effective_chat.send_message(text)
+        await update.effective_chat.send_message("Only admins or HR managers can set status.")
+        return
 
+    await crud.set_driver_status(driver_id, new_status)
+    await update.effective_chat.send_message(f"✅ Status for #D{driver_id} set to {new_status}.")
 
-# ---- HELP & UNKNOWN ----
+    # notify recruiter
+    recruiter = await crud.get_user(d.recruiter_id)
+    if recruiter and recruiter.telegram_id:
+        try:
+            await context.bot.send_message(
+                int(recruiter.telegram_id),
+                f"ℹ️ Status update for <b>#D{driver_id}</b>: <b>{new_status}</b>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+async def driver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /driver <driver_id>"); return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.effective_chat.send_message("Driver ID must be a number."); return
+    d = await crud.find_driver_by_ref(driver_id)
+    if not d:
+        await update.effective_chat.send_message("Driver not found."); return
+    await update.effective_chat.send_message(
+        f"#D{d.id} — status: <b>{d.status}</b>\nName: {d.name or '—'}\nPhone: {d.phone or '—'}",
+        parse_mode=ParseMode.HTML
+    )
+
+# ---- Company Inbox (replies & follow-ups) ----
+REF_RX = re.compile(r"#D(\d+)\b")
+
+async def company_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    text = (msg.text or msg.caption or "").strip()
+
+    driver = None
+
+    # 1) Direct reply to original post
+    if msg.reply_to_message:
+        try:
+            replied_id = msg.reply_to_message.message_id
+            driver = await crud.find_driver_by_group_msg(chat.id, replied_id)
+        except Exception:
+            driver = None
+
+    # 2) Fallback: message contains Ref #D123
+    if not driver and text:
+        m = REF_RX.search(text)
+        if m:
+            ref_id = int(m.group(1))
+            candidate = await crud.find_driver_by_ref(ref_id)
+            # accept only if it’s the same company chat where we posted
+            if candidate and candidate.company_chat_id and candidate.company_chat_id == str(chat.id):
+                driver = candidate
+
+    if not driver:
+        return  # ignore unrelated messages
+
+    # Log reply
+    who = f"{msg.from_user.full_name} (@{msg.from_user.username})" if msg.from_user else "unknown"
+    await crud.create_driver_reply(driver.id, who, text, msg.message_id)
+
+    # Notify recruiter + HR
+    try:
+        recruiter = await crud.get_user(driver.recruiter_id)
+        hr = await crud.get_user(recruiter.manager_id) if recruiter and recruiter.manager_id else None
+
+        notice = f"💬 <b>Company replied</b> on <b>#D{driver.id}</b>\nFrom: {who}\n\n{text or '(no text)'}"
+        if recruiter and recruiter.telegram_id:
+            await context.bot.send_message(int(recruiter.telegram_id), notice, parse_mode=ParseMode.HTML)
+        if hr and hr.telegram_id:
+            await context.bot.send_message(int(hr.telegram_id), notice, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+# ---- HELP & Unknown ----
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """
-<b>HOMBA Recruit Bot – Commands</b>
-
-👤 Recruiters:
-  /start – begin / login
-  /new – submit a new driver
-
-👮 Admins:
-  /admin – open Admin Panel
-  /add_user <username> <password> [role]
-  /rename_user <user_id> <new_username>
-  /set_pass <user_id> <new_password>
-  /del_user <user_id>
-  /add_company <name> <chat_id>
-  /rename_company <company_id> <new_name>
-  /set_company_chat <company_id> <chat_id>
-  /del_company <company_id>
-"""
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
+    me = await require_user(context, update.effective_chat.id)
+    base = [
+        "👤 <b>Recruiters</b>",
+        "  /start – begin / login",
+        "  /new – submit a new driver",
+        "  /driver &lt;driver_id&gt; – view driver status",
+    ]
+    hr = [
+        "",
+        "🧑‍💼 <b>HR Managers</b>",
+        "  /my_team – list your recruiters",
+        "  /add_user &lt;username&gt; &lt;password&gt; recruiter",
+        "  /rename_user &lt;user_id&gt; &lt;new_username&gt;",
+        "  /set_pass &lt;user_id&gt; &lt;new_password&gt;",
+        "  /set_status &lt;driver_id&gt; &lt;approved|waiting|rejected&gt;",
+    ]
+    adm = [
+        "",
+        "👮 <b>Admins</b>",
+        "  /admin – open Admin Panel",
+        "  /add_user &lt;username&gt; &lt;password&gt; [role]",
+        "  /rename_user &lt;user_id&gt; &lt;new_username&gt;",
+        "  /set_pass &lt;user_id&gt; &lt;new_password&gt;",
+        "  /del_user &lt;user_id&gt;",
+        "  /add_company &lt;name&gt; &lt;chat_id&gt;",
+        "  /rename_company &lt;company_id&gt; &lt;new_name&gt;",
+        "  /set_company_chat &lt;company_id&gt; &lt;chat_id&gt;",
+        "  /del_company &lt;company_id&gt;",
+    ]
+    lines = base[:]
+    if me and me.role in ("hr_manager", "admin"): lines += hr
+    if me and me.role == "admin": lines += adm
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Unknown command. Type /help for the list.")
 
-
 # =========================
-# STARTUP (single, Python 3.12/3.13-safe)
+# STARTUP
 # =========================
 def _build_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -760,9 +859,13 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("set_company_chat", company_chat_cmd))
     app.add_handler(CommandHandler("del_company", del_company_cmd))
 
+    app.add_handler(CommandHandler("my_team", my_team_cmd))
+    app.add_handler(CommandHandler("set_status", set_status_cmd))
+    app.add_handler(CommandHandler("driver", driver_cmd))
+
     # login flow
     login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_login_button, pattern="^login$")],
+        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$")],
         states={
             S_LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             S_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
@@ -795,14 +898,16 @@ def _build_app() -> Application:
     )
     app.add_handler(new_conv)
 
-    # unknown commands (keep last)
+    # company inbox listener (all group messages, non-command)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, company_inbox))
+
+    # unknown commands last
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-    
+
+    # admin panel callbacks
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^(admin|user|co):"))
 
-
     return app
-
 
 async def main():
     await seed_bootstrap()
@@ -816,7 +921,6 @@ async def main():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())

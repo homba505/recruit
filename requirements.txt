@@ -7,3 +7,4 @@ alembic
 asyncpg
 greenlet
 reportlab==4.4.3
+bcrypt
