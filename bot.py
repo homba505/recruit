@@ -926,6 +926,13 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Unknown command. Type /help for the list.")
+# --- Chat ID helper ---
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.effective_chat.send_message(
+        f"Chat ID: <code>{chat.id}</code>\nType: <b>{chat.type}</b>",
+        parse_mode=ParseMode.HTML
+    )
 
 # =========================
 # STARTUP
@@ -952,7 +959,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("my_team", my_team_cmd))
     app.add_handler(CommandHandler("set_status", set_status_cmd))
     app.add_handler(CommandHandler("driver", driver_cmd))
-
+# 🔹 Add this line right here:
+    app.add_handler(CommandHandler("chatid", chatid))
     # login flow
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$")],
