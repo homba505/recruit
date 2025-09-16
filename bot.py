@@ -15,10 +15,9 @@ from telegram import (
     InputMediaPhoto,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -43,6 +42,13 @@ DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fayzo2008")
 
 PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
 
+# Assets & optional mirror/audit chats
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")  # put your file at assets/logo.png
+
+ARCHIVE_CHAT_ID = os.getenv("ARCHIVE_CHAT_ID")  # optional backup group/channel id
+AUDIT_CHAT_ID = os.getenv("AUDIT_CHAT_ID")      # optional audit group/channel id
+
 # =========================
 # STATES
 # =========================
@@ -58,7 +64,8 @@ PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
     S_NEW_FILE1,
     S_NEW_FILE2,
     S_PICK_COMPANY,
-) = range(11)
+    S_NOTE_WAIT,           # new state for notes flow
+) = range(12)
 
 # sessions & temp
 SESSIONS: Dict[int, int] = {}         # chat_id -> user_id
@@ -67,8 +74,15 @@ NEW_APP: Dict[int, Dict] = {}         # per-chat draft app
 def ensure_pdf_dir():
     os.makedirs(PDF_DIR, exist_ok=True)
 
-def need_login() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]])
+async def _try_send_audit(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Send audit message if AUDIT_CHAT_ID is configured."""
+    if not AUDIT_CHAT_ID:
+        return
+    try:
+        chat_id = int(AUDIT_CHAT_ID) if AUDIT_CHAT_ID.lstrip("-").isdigit() else AUDIT_CHAT_ID
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        pass
 
 async def seed_bootstrap() -> None:
     async with engine.begin() as conn:
@@ -104,13 +118,21 @@ async def generate_driver_pdf(
     c = canvas.Canvas(pdf_path, pagesize=A4)
     W, H = A4
 
-    # Header
+    # draw logo if present (page 1)
+    try:
+        if os.path.exists(LOGO_PATH):
+            c.drawImage(LOGO_PATH, 35, H - 70, width=120, height=45, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+
+    # Header bar
     c.setFillColorRGB(0.066, 0.285, 0.43)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 22)
     c.drawString(30, H - 40, "HOMBA — Driver Application")
 
+    # Body
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica", 12)
     y = H - 110
@@ -133,9 +155,17 @@ async def generate_driver_pdf(
     y -= 6
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(left, y, "Generated automatically by HOMBA Recruit Bot")
-    c.showPage()
 
     # Page 2: docs
+    c.showPage()
+    # logo on page 2 as well (optional)
+    try:
+        if os.path.exists(LOGO_PATH):
+            c.drawImage(LOGO_PATH, 35, H - 70, width=120, height=45, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+
+    # Download telegram files to temp
     tmp_files: List[str] = []
     for fid in [file_ids[0], file_ids[1]]:
         if not fid:
@@ -172,8 +202,10 @@ async def generate_driver_pdf(
 
     for p in tmp_files:
         if p and os.path.exists(p):
-            try: os.remove(p)
-            except Exception: pass
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
     return pdf_path
 
@@ -191,7 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.effective_chat.send_message(
             "Welcome to HOMBA Recruit Bot!\nPlease log in to continue.",
-            reply_markup=need_login(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]),
         )
 
 # ---- LOGIN ----
@@ -226,7 +258,8 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u:
-        await update.effective_chat.send_message("You need to log in.", reply_markup=need_login())
+        await update.effective_chat.send_message("You need to log in.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]))
         return ConversationHandler.END
 
     NEW_APP[update.effective_chat.id] = {"kind": None, "file_ids": [None, None]}
@@ -330,7 +363,8 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id
     user = await require_user(context, chat_id)
     if not user:
-        await q.edit_message_text("You need to log in.", reply_markup=need_login())
+        await q.edit_message_text("You need to log in.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]))
         return ConversationHandler.END
 
     company_id = int(q.data.split(":")[1])
@@ -341,7 +375,8 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     d = NEW_APP.get(chat_id, {})
     file_types = f"{d.get('file_types_1','')},{d.get('file_types_2','')}"
-    file_ids = f"{d['file_ids'][0] or ''}|{d['file_ids'][1] or ''}"
+    fid1, fid2 = d["file_ids"]
+    file_ids = f"{fid1 or ''}|{fid2 or ''}"
 
     driver_id = await crud.create_driver(
         kind=d["kind"],
@@ -384,7 +419,6 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # send media
     media = []
-    fid1, fid2 = d["file_ids"]
     if fid1:
         media.append(InputMediaPhoto(media=fid1, caption="CDL"))
     if fid2:
@@ -425,6 +459,22 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # Mirror to archive (if configured)
+    if ARCHIVE_CHAT_ID:
+        try:
+            mirror_chat = int(ARCHIVE_CHAT_ID) if ARCHIVE_CHAT_ID.lstrip("-").isdigit() else ARCHIVE_CHAT_ID
+            await context.bot.send_document(
+                chat_id=mirror_chat,
+                document=open(pdf_path, "rb"),
+                filename=os.path.basename(pdf_path),
+                caption=f"[ARCHIVE] Driver Summary — Ref #D{driver_id} → {company.name}",
+            )
+        except Exception:
+            pass
+
+    # Audit line (if configured)
+    await _try_send_audit(context, f"📨 Driver #{driver_id} submitted to {company.name} by {user.username}")
+
     await q.edit_message_text("✅ Submitted to company.")
     NEW_APP.pop(chat_id, None)
     return ConversationHandler.END
@@ -460,11 +510,11 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     head = parts[0]
     tail = parts[1] if len(parts) > 1 else ""
 
-    # who
     chat_id = q.message.chat_id
     me = await require_user(context, chat_id)
     if not me:
-        await q.edit_message_text("You need to log in.", reply_markup=need_login())
+        await q.edit_message_text("You need to log in.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]))
         return
 
     if head == "admin":
@@ -484,7 +534,6 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
                 await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
-                # HR: list only team
                 users = await crud.list_team(me.id)
                 lines = [f"{u.id}. {u.username} ({'✅' if u.is_active else '❌'})" for u in users]
                 text = "👤 <b>Your Team</b>\n" + ("\n".join(lines) or "No recruiters yet")
@@ -521,7 +570,6 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sub == "back":
             await admin_menu(update, context); return
 
-    # buttons show how-to commands (kept simple)
     if head == "user":
         action = tail
         if action == "add":
@@ -799,7 +847,38 @@ async def company_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---- HELP & Unknown ----
+# ---- NOTES (simple: HR/Admin only, stored in DriverReply) ----
+async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /note <driver_id>  — then send the note text in the next message."""
+    u = await require_user(context, update.effective_chat.id)
+    if not u or u.role not in ("hr_manager", "admin"):
+        await update.effective_chat.send_message("Only HR/Admin can add notes.")
+        return ConversationHandler.END
+    args = (update.message.text or "").split()
+    if len(args) < 2 or not args[1].isdigit():
+        await update.effective_chat.send_message("Usage: /note <driver_id>")
+        return ConversationHandler.END
+    driver_id = int(args[1])
+    context.user_data['note_driver_id'] = driver_id
+    await update.effective_chat.send_message(f"✍️ Send your note text for driver #{driver_id} as a single message.")
+    return S_NOTE_WAIT
+
+async def take_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await require_user(context, update.effective_chat.id)
+    if not u or u.role not in ("hr_manager", "admin"):
+        return ConversationHandler.END
+    driver_id = context.user_data.get('note_driver_id')
+    text = (update.message.text or '').strip()
+    if not (driver_id and text):
+        await update.effective_chat.send_message("Nothing to save.")
+        return ConversationHandler.END
+    await crud.create_driver_reply(driver_id, from_user=f"NOTE:{u.username}", text=text, message_id=update.message.message_id)
+    await update.effective_chat.send_message(f"🗒️ Note saved for driver #{driver_id}.")
+    await _try_send_audit(context, f"🗒️ Note added by {u.username} for driver #{driver_id}: {text[:140]}")
+    context.user_data.pop('note_driver_id', None)
+    return ConversationHandler.END
+
+# ---- HELP & Logout & Unknown ----
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await require_user(context, update.effective_chat.id)
     base = [
@@ -807,6 +886,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /start – begin / login",
         "  /new – submit a new driver",
         "  /driver &lt;driver_id&gt; – view driver status",
+        "  /logout – log out",
     ]
     hr = [
         "",
@@ -816,6 +896,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /rename_user &lt;user_id&gt; &lt;new_username&gt;",
         "  /set_pass &lt;user_id&gt; &lt;new_password&gt;",
         "  /set_status &lt;driver_id&gt; &lt;approved|waiting|rejected&gt;",
+        "  /note &lt;driver_id&gt; – add internal note",
     ]
     adm = [
         "",
@@ -835,18 +916,27 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if me and me.role == "admin": lines += adm
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in SESSIONS:
+        SESSIONS.pop(chat_id, None)
+        await update.effective_chat.send_message("✅ Logged out. Use /start to log in again.")
+    else:
+        await update.effective_chat.send_message("ℹ️ You are not logged in. Use /start to log in.")
+
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Unknown command. Type /help for the list.")
 
 # =========================
 # STARTUP
 # =========================
-def _build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def build_application() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
 
     # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("admin", admin_menu))
 
     app.add_handler(CommandHandler("add_user", add_user_cmd))
@@ -877,6 +967,17 @@ def _build_app() -> Application:
     )
     app.add_handler(login_conv)
 
+    # note flow
+    note_conv = ConversationHandler(
+        entry_points=[CommandHandler("note", cmd_note)],
+        states={ S_NOTE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_note_text)] },
+        fallbacks=[],
+        per_chat=True,
+        per_user=True,
+        name="note_flow",
+    )
+    app.add_handler(note_conv)
+
     # new driver flow
     new_conv = ConversationHandler(
         entry_points=[CommandHandler("new", cmd_new)],
@@ -901,26 +1002,19 @@ def _build_app() -> Application:
     # company inbox listener (all group messages, non-command)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, company_inbox))
 
-    # unknown commands last
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-
     # admin panel callbacks
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^(admin|user|co):"))
 
+    # unknown commands last
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
+
     return app
 
-async def main():
-    await seed_bootstrap()
-    app = _build_app()
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+def main():
+    app = build_application()
+    # PTB 21: this blocks and manages the loop correctly (Python 3.12/3.13 safe)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(seed_bootstrap())
+    main()
