@@ -213,8 +213,7 @@ async def generate_driver_pdf(
 # Commands & flows
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await seed_bootstrap()
-    chat_id = update.effective_chat.id
+chat_id = update.effective_chat.id
     u = await require_user(context, chat_id)
     if u:
         await update.effective_chat.send_message(
@@ -963,7 +962,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("chatid", chatid))
     # login flow
     login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$")],
+        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$", per_message=True)],
         states={
             S_LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             S_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
@@ -977,7 +976,7 @@ def build_application() -> Application:
 
     # note flow
     note_conv = ConversationHandler(
-        entry_points=[CommandHandler("note", cmd_note)],
+        entry_points=[CommandHandler("note", cmd_note, per_message=True)],
         states={ S_NOTE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_note_text)] },
         fallbacks=[],
         per_chat=True,
@@ -988,7 +987,7 @@ def build_application() -> Application:
 
     # new driver flow
     new_conv = ConversationHandler(
-        entry_points=[CommandHandler("new", cmd_new)],
+        entry_points=[CommandHandler("new", cmd_new, per_message=True)],
         states={
             S_NEW_KIND: [CallbackQueryHandler(cb_pick_kind, pattern=r"^kind:.+$")],
             S_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_name)],
@@ -1023,10 +1022,17 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app.updater.wait()
-    await app.stop()
-    await app.shutdown()
+    await asyncio.Event().wait()
 
-if __name__ == "__main__":
+# =========================
+# STARTUP (simplified, PTB 21.x)
+# =========================
+def _homba_main():
+    app = build_application()
+    import asyncio
     asyncio.run(seed_bootstrap())
-    asyncio.run(main())
+    from telegram import Update
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    _homba_main()
