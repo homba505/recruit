@@ -1018,11 +1018,15 @@ def build_application() -> Application:
 
     return app
 
-def main():
+async def main():
     app = build_application()
-    # PTB 21: this blocks and manages the loop correctly (Python 3.12/3.13 safe)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.updater.wait()
+    await app.stop()
+    await app.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(seed_bootstrap())
-    main()
+    asyncio.run(main())
