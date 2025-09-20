@@ -1,12 +1,16 @@
-# bot.py
+# bot.py — HOMBA Recruit Bot (all-in-one, Python 3.12/3.13-safe)
+
 import asyncio
 import os
 import re
 import textwrap
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+
+from sqlalchemy import select, func
 
 from telegram import (
     Update,
@@ -26,9 +30,11 @@ from telegram.ext import (
     filters,
 )
 
-from db import Base, engine
-from db_models import User, Company
+# ===== DB imports (use your existing modules) =====
+from db import Base, engine, AsyncSessionLocal
+from db_models import User, Company, Driver, DriverReply, PdfFile
 import crud
+
 
 # =========================
 # CONFIG
@@ -42,12 +48,14 @@ DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fayzo2008")
 
 PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
 
-# Assets & optional mirror/audit chats
+# Assets & optional mirror/audit/report chats
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
-LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")  # put your file at assets/logo.png
+LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")  # optional; put your PNG here
 
-ARCHIVE_CHAT_ID = os.getenv("ARCHIVE_CHAT_ID")  # optional backup group/channel id
-AUDIT_CHAT_ID = os.getenv("AUDIT_CHAT_ID")      # optional audit group/channel id
+ARCHIVE_CHAT_ID = os.getenv("ARCHIVE_CHAT_ID")          # optional backup group/channel
+AUDIT_CHAT_ID = os.getenv("AUDIT_CHAT_ID")              # optional audit group/channel
+WEEKLY_REPORT_CHAT_ID = os.getenv("WEEKLY_REPORT_CHAT_ID")  # optional auto-destination
+
 
 # =========================
 # STATES
@@ -64,18 +72,19 @@ AUDIT_CHAT_ID = os.getenv("AUDIT_CHAT_ID")      # optional audit group/channel i
     S_NEW_FILE1,
     S_NEW_FILE2,
     S_PICK_COMPANY,
-    S_NOTE_WAIT,           # new state for notes flow
+    S_NOTE_WAIT,           # note flow
 ) = range(12)
 
 # sessions & temp
-SESSIONS: Dict[int, int] = {}         # chat_id -> user_id
+SESSIONS: Dict[int, int] = {}         # chat_id -> user_id (simple session map)
 NEW_APP: Dict[int, Dict] = {}         # per-chat draft app
+
 
 def ensure_pdf_dir():
     os.makedirs(PDF_DIR, exist_ok=True)
 
+
 async def _try_send_audit(context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Send audit message if AUDIT_CHAT_ID is configured."""
     if not AUDIT_CHAT_ID:
         return
     try:
@@ -83,6 +92,7 @@ async def _try_send_audit(context: ContextTypes.DEFAULT_TYPE, text: str):
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception:
         pass
+
 
 async def seed_bootstrap() -> None:
     async with engine.begin() as conn:
@@ -92,15 +102,25 @@ async def seed_bootstrap() -> None:
     if not admin:
         await crud.create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, role="admin")
 
+
 async def require_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[User]:
     uid = SESSIONS.get(chat_id)
     if not uid:
         return None
     return await crud.get_user(uid)
 
+
 # =========================
-# PDF generation
+# PDF helpers
 # =========================
+def _draw_logo(c: canvas.Canvas, W, H):
+    try:
+        if os.path.exists(LOGO_PATH):
+            c.drawImage(LOGO_PATH, 35, H - 70, width=120, height=45, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+
+
 async def generate_driver_pdf(
     driver_id: int,
     kind: str,
@@ -118,21 +138,14 @@ async def generate_driver_pdf(
     c = canvas.Canvas(pdf_path, pagesize=A4)
     W, H = A4
 
-    # draw logo if present (page 1)
-    try:
-        if os.path.exists(LOGO_PATH):
-            c.drawImage(LOGO_PATH, 35, H - 70, width=120, height=45, preserveAspectRatio=True, mask='auto')
-    except Exception:
-        pass
-
-    # Header bar
+    # PAGE 1
+    _draw_logo(c, W, H)
     c.setFillColorRGB(0.066, 0.285, 0.43)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 22)
     c.drawString(30, H - 40, "HOMBA — Driver Application")
 
-    # Body
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica", 12)
     y = H - 110
@@ -156,16 +169,9 @@ async def generate_driver_pdf(
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(left, y, "Generated automatically by HOMBA Recruit Bot")
 
-    # Page 2: docs
+    # PAGE 2 — docs
     c.showPage()
-    # logo on page 2 as well (optional)
-    try:
-        if os.path.exists(LOGO_PATH):
-            c.drawImage(LOGO_PATH, 35, H - 70, width=120, height=45, preserveAspectRatio=True, mask='auto')
-    except Exception:
-        pass
-
-    # Download telegram files to temp
+    _draw_logo(c, W, H)
     tmp_files: List[str] = []
     for fid in [file_ids[0], file_ids[1]]:
         if not fid:
@@ -184,18 +190,19 @@ async def generate_driver_pdf(
     c.setFont("Helvetica", 12)
     c.drawString(40, H - 80, "CDL and Medical Card")
 
-    def draw_image_center(img_path: str, y_top: float, height: float):
+    def draw_full(img_path: str, y_top: float, height: float):
         try:
-            c.drawImage(img_path, 40, y_top - height, width=W - 80, height=height, preserveAspectRatio=True, mask='auto')
+            c.drawImage(img_path, 40, y_top - height, width=W - 80, height=height,
+                        preserveAspectRatio=True, mask='auto')
         except Exception:
             pass
 
     top = H - 110
     each_height = (H - 160) / 2
     if tmp_files[0]:
-        draw_image_center(tmp_files[0], top, each_height)
+        draw_full(tmp_files[0], top, each_height)
     if tmp_files[1]:
-        draw_image_center(tmp_files[1], top - each_height - 20, each_height)
+        draw_full(tmp_files[1], top - each_height - 20, each_height)
 
     c.showPage()
     c.save()
@@ -209,21 +216,151 @@ async def generate_driver_pdf(
 
     return pdf_path
 
+
+# =========================
+# Weekly Report (PDF)
+# =========================
+async def generate_weekly_report_pdf(days: int = 7) -> str:
+    """Build a PDF summary for the last `days` days. Falls back to all-time if created_at not present."""
+    ensure_pdf_dir()
+    pdf_path = os.path.join(PDF_DIR, f"weekly_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf")
+
+    start = datetime.utcnow() - timedelta(days=days)
+    end = datetime.utcnow()
+
+    # Query safely (if created_at missing, we won't filter)
+    async with AsyncSessionLocal() as s:
+        try:
+            # per company counts
+            q_company = (
+                select(Company.name, func.count(Driver.id))
+                .join(Driver, Driver.company_id == Company.id, isouter=True)
+                .where(Driver.created_at >= start, Driver.created_at < end)
+                .group_by(Company.id)
+            )
+            comp_rows = (await s.execute(q_company)).all()
+
+            # per recruiter counts
+            q_recr = (
+                select(User.username, func.count(Driver.id))
+                .join(Driver, Driver.recruiter_id == User.id, isouter=True)
+                .where(Driver.created_at >= start, Driver.created_at < end)
+                .group_by(User.id)
+            )
+            recr_rows = (await s.execute(q_recr)).all()
+
+            # status breakdown
+            q_status = (
+                select(Driver.status, func.count(Driver.id))
+                .where(Driver.created_at >= start, Driver.created_at < end)
+                .group_by(Driver.status)
+            )
+            status_rows = (await s.execute(q_status)).all()
+
+        except Exception:
+            # fallback to all time (no created_at)
+            q_company = (
+                select(Company.name, func.count(Driver.id))
+                .join(Driver, Driver.company_id == Company.id, isouter=True)
+                .group_by(Company.id)
+            )
+            comp_rows = (await s.execute(q_company)).all()
+
+            q_recr = (
+                select(User.username, func.count(Driver.id))
+                .join(Driver, Driver.recruiter_id == User.id, isouter=True)
+                .group_by(User.id)
+            )
+            recr_rows = (await s.execute(q_recr)).all()
+
+            q_status = select(Driver.status, func.count(Driver.id)).group_by(Driver.status)
+            status_rows = (await s.execute(q_status)).all()
+
+    # Simple revenue estimate (Pay-per-hire = $500 per approved)
+    approved_count = 0
+    for st, cnt in status_rows:
+        if (st or "").lower() == "approved":
+            approved_count += int(cnt or 0)
+    est_revenue_pph = approved_count * 500
+
+    # PDF
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    W, H = A4
+    _draw_logo(c, W, H)
+
+    title = f"HOMBA — Weekly Report (last {days} days)"
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(40, H - 50, title)
+    c.setFont("Helvetica", 10)
+    c.drawString(40, H - 65, f"Generated at: {datetime.utcnow():%Y-%m-%d %H:%M UTC}")
+
+    y = H - 95
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, "Per Company"); y -= 16
+    c.setFont("Helvetica", 12)
+    if comp_rows:
+        for name, cnt in comp_rows:
+            c.drawString(50, y, f"{name or '—'}: {int(cnt or 0)}")
+            y -= 16
+    else:
+        c.drawString(50, y, "No data")
+        y -= 16
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, "Recruiter Leaderboard"); y -= 16
+    c.setFont("Helvetica", 12)
+    if recr_rows:
+        # sort by count desc
+        for uname, cnt in sorted(recr_rows, key=lambda r: int(r[1] or 0), reverse=True):
+            c.drawString(50, y, f"{uname or '—'}: {int(cnt or 0)}")
+            y -= 16
+            if y < 80:
+                c.showPage(); y = H - 60
+    else:
+        c.drawString(50, y, "No data"); y -= 16
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, "Status Breakdown"); y -= 16
+    c.setFont("Helvetica", 12)
+    if status_rows:
+        for st, cnt in status_rows:
+            c.drawString(50, y, f"{(st or '—').upper()}: {int(cnt or 0)}")
+            y -= 16
+            if y < 80:
+                c.showPage(); y = H - 60
+    else:
+        c.drawString(50, y, "No data"); y -= 16
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, "Est. Revenue (Pay-per-hire)"); y -= 16
+    c.setFont("Helvetica", 12)
+    c.drawString(50, y, f"Approved drivers: {approved_count} × $500 = ${est_revenue_pph:,}")
+
+    c.showPage()
+    c.save()
+    return pdf_path
+
+
 # =========================
 # Commands & flows
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-chat_id = update.effective_chat.id
+    await seed_bootstrap()
+    chat_id = update.effective_chat.id
     u = await require_user(context, chat_id)
     if u:
         await update.effective_chat.send_message(
-            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins/HR: /admin"
+            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins/HR: /admin • /weekly_report"
         )
     else:
         await update.effective_chat.send_message(
             "Welcome to HOMBA Recruit Bot!\nPlease log in to continue.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]),
         )
+
 
 # ---- LOGIN ----
 async def cb_login_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,18 +377,15 @@ async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uname = context.user_data.get("login_username")
     pwd = update.message.text.strip()
-
     user = await crud.get_user_by_username(uname)
-    # bcrypt verification + active
     if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
         await update.message.reply_text("❌ Invalid credentials or inactive user.")
         return ConversationHandler.END
-
     await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
     SESSIONS[update.effective_chat.id] = user.id
-
     await update.message.reply_text(f"✅ Logged in as {user.username}. Use /new to submit a driver.")
     return ConversationHandler.END
+
 
 # ---- NEW DRIVER ----
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,7 +525,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         company_chat_id=company.telegram_chat_id,
     )
 
-    # compose & send (include Ref)
+    # compose & send
     text_msg = textwrap.dedent(f"""
         <b>New driver application</b>
 
@@ -416,12 +550,15 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Failed to post to company group: {e.message}")
         return ConversationHandler.END
 
-    # send media
-    media = []
+    # send media as an album (caption only on first item)
+    media: List[InputMediaPhoto] = []
     if fid1:
         media.append(InputMediaPhoto(media=fid1, caption="CDL"))
     if fid2:
-        media.append(InputMediaPhoto(media=fid2, caption="Medical Card"))
+        if media:
+            media.append(InputMediaPhoto(media=fid2))  # no caption on second
+        else:
+            media.append(InputMediaPhoto(media=fid2, caption="Medical Card"))
     if media:
         try:
             await context.bot.send_media_group(chat_id=int(company.telegram_chat_id), media=media)
@@ -434,7 +571,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try: await context.bot.send_photo(int(company.telegram_chat_id), fid2, caption="Medical Card")
                 except Exception: pass
 
-    # send PDF
+    # PDF
     pdf_path = await generate_driver_pdf(
         driver_id=driver_id,
         kind=d["kind"],
@@ -458,7 +595,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Mirror to archive (if configured)
+    # Mirror to archive
     if ARCHIVE_CHAT_ID:
         try:
             mirror_chat = int(ARCHIVE_CHAT_ID) if ARCHIVE_CHAT_ID.lstrip("-").isdigit() else ARCHIVE_CHAT_ID
@@ -471,12 +608,13 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Audit line (if configured)
+    # Audit line
     await _try_send_audit(context, f"📨 Driver #{driver_id} submitted to {company.name} by {user.username}")
 
     await q.edit_message_text("✅ Submitted to company.")
     NEW_APP.pop(chat_id, None)
     return ConversationHandler.END
+
 
 # ---- ADMIN PANEL ----
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,27 +625,28 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("👤 Users", callback_data="admin:users"),
              InlineKeyboardButton("🏢 Companies", callback_data="admin:companies")],
-            [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
-             InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
+            [InlineKeyboardButton("🏆 Leaderboard (now)", callback_data="admin:leaderboard"),
+             InlineKeyboardButton("📊 Weekly Report (now)", callback_data="admin:report")],
+            [InlineKeyboardButton("💸 Offers text", callback_data="admin:offers")],
         ])
     elif u.role == "hr_manager":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("👤 Users", callback_data="admin:users")],
-            [InlineKeyboardButton("🏆 Send Leaderboard (now)", callback_data="admin:leaderboard"),
-             InlineKeyboardButton("📊 Send Weekly Report (now)", callback_data="admin:report")],
+            [InlineKeyboardButton("🏆 Leaderboard (now)", callback_data="admin:leaderboard"),
+             InlineKeyboardButton("📊 Weekly Report (now)", callback_data="admin:report")],
+            [InlineKeyboardButton("💸 Offers text", callback_data="admin:offers")],
         ])
     else:
         await update.effective_chat.send_message("Admins/HR only.")
         return
     await update.effective_chat.send_message("Admin panel:", reply_markup=kb)
 
+
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-    parts = data.split(":", 1)
-    head = parts[0]
-    tail = parts[1] if len(parts) > 1 else ""
+    head, _, tail = data.partition(":")
 
     chat_id = q.message.chat_id
     me = await require_user(context, chat_id)
@@ -547,8 +686,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if sub == "companies":
             if me.role != "admin":
-                await q.edit_message_text("Admins only.")
-                return
+                await q.edit_message_text("Admins only."); return
             companies = await crud.list_companies()
             lines = [f"{c.id}. {c.name} — <code>{c.telegram_chat_id}</code>" for c in companies]
             text = "🏢 <b>Companies</b>\n" + ("\n".join(lines) or "No companies")
@@ -564,8 +702,13 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if sub == "leaderboard":
             await send_leaderboard_now(update, context, edit=True); return
+
         if sub == "report":
             await send_report_now(update, context, edit=True); return
+
+        if sub == "offers":
+            await q.edit_message_text(offers_text(), parse_mode=ParseMode.HTML); return
+
         if sub == "back":
             await admin_menu(update, context); return
 
@@ -601,6 +744,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "Unknown."
         await q.edit_message_text(text, parse_mode=ParseMode.HTML); return
 
+
 # ---- ADMIN QUICK COMMANDS ----
 async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -627,6 +771,7 @@ async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_message("You don't have permission to add users.")
 
+
 async def rename_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u: return
@@ -649,6 +794,7 @@ async def rename_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_message("You don't have permission to rename users.")
 
+
 async def pass_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u: return
@@ -669,6 +815,7 @@ async def pass_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_message("You don't have permission to change passwords.")
 
+
 async def del_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u: return
@@ -679,6 +826,7 @@ async def del_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crud.delete_user(int(context.args[0]))
     await update.effective_chat.send_message("🗑 Deleted")
 
+
 async def add_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u or u.role != "admin": return
@@ -686,6 +834,7 @@ async def add_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message("Usage: /add_company <name> <chat_id>"); return
     ok, err = await crud.create_company(context.args[0], context.args[1])
     await update.effective_chat.send_message("✅ Added" if ok else f"❌ {err or 'Failed'}")
+
 
 async def rename_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -695,6 +844,7 @@ async def rename_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ok, err = await crud.rename_company(int(context.args[0]), context.args[1])
     await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
 
+
 async def company_chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u or u.role != "admin": return
@@ -702,6 +852,7 @@ async def company_chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message("Usage: /set_company_chat <company_id> <chat_id>"); return
     await crud.change_company_chat_id(int(context.args[0]), context.args[1])
     await update.effective_chat.send_message("🔁 Chat ID changed")
+
 
 async def del_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -711,16 +862,38 @@ async def del_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crud.delete_company(int(context.args[0]))
     await update.effective_chat.send_message("🗑 Deleted")
 
-# ---- LEADERBOARD / REPORT stubs ----
+
+# ---- LEADERBOARD / REPORT ----
 async def send_leaderboard_now(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    text = "🏆 Recruiter Leaderboard (weekly)\n(placeholder)"
-    if edit and update.callback_query: await update.callback_query.edit_message_text(text)
-    else: await update.effective_chat.send_message(text)
+    text = "🏆 Recruiter Leaderboard (weekly)\n(placeholder from stored stats)"
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.effective_chat.send_message(text)
+
 
 async def send_report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    text = "📊 Weekly Report sent. (placeholder)"
-    if edit and update.callback_query: await update.callback_query.edit_message_text(text)
-    else: await update.effective_chat.send_message(text)
+    pdf = await generate_weekly_report_pdf(days=7)
+    chat_id = update.effective_chat.id if not update.callback_query else update.effective_chat.id
+    # send here
+    try:
+        await context.bot.send_document(chat_id=chat_id, document=open(pdf, "rb"),
+                                        filename=os.path.basename(pdf),
+                                        caption="📊 Weekly Report (last 7 days)")
+    except Exception:
+        pass
+    # optional: mirror to configured report chat
+    if WEEKLY_REPORT_CHAT_ID:
+        try:
+            rpt = int(WEEKLY_REPORT_CHAT_ID) if WEEKLY_REPORT_CHAT_ID.lstrip("-").isdigit() else WEEKLY_REPORT_CHAT_ID
+            await context.bot.send_document(chat_id=rpt, document=open(pdf, "rb"),
+                                            filename=os.path.basename(pdf),
+                                            caption="📊 Weekly Report (auto copy)")
+        except Exception:
+            pass
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text("✅ Weekly report sent.")
+
 
 # ---- HR / Status / View ----
 VALID_STATUSES = {"approved", "waiting", "rejected"}
@@ -734,6 +907,7 @@ async def my_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message("Your team is empty. Use /add_user to create recruiters."); return
     lines = [f"{u.id}. {u.username} ({'✅' if u.is_active else '❌'})" for u in team]
     await update.effective_chat.send_message("👥 <b>Your Recruiters</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+
 
 async def set_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -780,6 +954,7 @@ async def set_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+
 async def driver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.effective_chat.send_message("Usage: /driver <driver_id>"); return
@@ -795,6 +970,7 @@ async def driver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+
 # ---- Company Inbox (replies & follow-ups) ----
 REF_RX = re.compile(r"#D(\d+)\b")
 
@@ -805,10 +981,9 @@ async def company_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (msg.text or msg.caption or "").strip()
-
     driver = None
 
-    # 1) Direct reply to original post
+    # method 1: reply to our original post
     if msg.reply_to_message:
         try:
             replied_id = msg.reply_to_message.message_id
@@ -816,20 +991,18 @@ async def company_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             driver = None
 
-    # 2) Fallback: message contains Ref #D123
+    # method 2: contains #D123 and same company chat
     if not driver and text:
         m = REF_RX.search(text)
         if m:
             ref_id = int(m.group(1))
             candidate = await crud.find_driver_by_ref(ref_id)
-            # accept only if it’s the same company chat where we posted
             if candidate and candidate.company_chat_id and candidate.company_chat_id == str(chat.id):
                 driver = candidate
 
     if not driver:
-        return  # ignore unrelated messages
+        return
 
-    # Log reply
     who = f"{msg.from_user.full_name} (@{msg.from_user.username})" if msg.from_user else "unknown"
     await crud.create_driver_reply(driver.id, who, text, msg.message_id)
 
@@ -846,7 +1019,8 @@ async def company_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---- NOTES (simple: HR/Admin only, stored in DriverReply) ----
+
+# ---- NOTES (simple: HR/Admin only) ----
 async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /note <driver_id>  — then send the note text in the next message."""
     u = await require_user(context, update.effective_chat.id)
@@ -877,7 +1051,20 @@ async def take_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('note_driver_id', None)
     return ConversationHandler.END
 
-# ---- HELP & Logout & Unknown ----
+
+# ---- HELP / LOGOUT / CHATID / OFFERS / UNKNOWN ----
+def offers_text() -> str:
+    return textwrap.dedent("""
+    <b>HOMBA Pricing Options</b>
+
+    1) <b>Pay-Per-Hire</b> — <b>$500</b> per successful hire.
+
+    2) <b>Premium Plan</b> — <b>$250</b> subscription to use the bot
+       + <b>$100</b> per approved solo driver (effectively $400 discount vs $500 PPH).
+
+    Ask us to switch your company to the plan you prefer.
+    """).strip()
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await require_user(context, update.effective_chat.id)
     base = [
@@ -896,6 +1083,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /set_pass &lt;user_id&gt; &lt;new_password&gt;",
         "  /set_status &lt;driver_id&gt; &lt;approved|waiting|rejected&gt;",
         "  /note &lt;driver_id&gt; – add internal note",
+        "  /weekly_report – get PDF for last 7 days",
     ]
     adm = [
         "",
@@ -909,6 +1097,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /rename_company &lt;company_id&gt; &lt;new_name&gt;",
         "  /set_company_chat &lt;company_id&gt; &lt;chat_id&gt;",
         "  /del_company &lt;company_id&gt;",
+        "  /weekly_report – get PDF for last 7 days",
+        "  /offers – pricing message",
     ]
     lines = base[:]
     if me and me.role in ("hr_manager", "admin"): lines += hr
@@ -923,15 +1113,38 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.effective_chat.send_message("ℹ️ You are not logged in. Use /start to log in.")
 
-async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("Unknown command. Type /help for the list.")
-# --- Chat ID helper ---
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.effective_chat.send_message(
         f"Chat ID: <code>{chat.id}</code>\nType: <b>{chat.type}</b>",
         parse_mode=ParseMode.HTML
     )
+
+async def offers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(offers_text(), parse_mode=ParseMode.HTML)
+
+async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = await require_user(context, update.effective_chat.id)
+    if not u or u.role not in ("hr_manager", "admin"):
+        await update.effective_chat.send_message("Only HR/Admin can request weekly reports.")
+        return
+    days = 7
+    if context.args and context.args[0].isdigit():
+        days = max(1, min(31, int(context.args[0])))
+    pdf = await generate_weekly_report_pdf(days=days)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(pdf, "rb"),
+            filename=os.path.basename(pdf),
+            caption=f"📊 Weekly Report (last {days} days)",
+        )
+    except Exception:
+        pass
+
+async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("Unknown command. Type /help for the list.")
+
 
 # =========================
 # STARTUP
@@ -958,11 +1171,13 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("my_team", my_team_cmd))
     app.add_handler(CommandHandler("set_status", set_status_cmd))
     app.add_handler(CommandHandler("driver", driver_cmd))
-# 🔹 Add this line right here:
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("offers", offers_cmd))
+    app.add_handler(CommandHandler("weekly_report", weekly_report_cmd))
+
     # login flow
     login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$", per_message=True)],
+        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$")],
         states={
             S_LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             S_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
@@ -976,7 +1191,7 @@ def build_application() -> Application:
 
     # note flow
     note_conv = ConversationHandler(
-        entry_points=[CommandHandler("note", cmd_note, per_message=True)],
+        entry_points=[CommandHandler("note", cmd_note)],
         states={ S_NOTE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_note_text)] },
         fallbacks=[],
         per_chat=True,
@@ -987,7 +1202,7 @@ def build_application() -> Application:
 
     # new driver flow
     new_conv = ConversationHandler(
-        entry_points=[CommandHandler("new", cmd_new, per_message=True)],
+        entry_points=[CommandHandler("new", cmd_new)],
         states={
             S_NEW_KIND: [CallbackQueryHandler(cb_pick_kind, pattern=r"^kind:.+$")],
             S_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_name)],
@@ -1017,22 +1232,18 @@ def build_application() -> Application:
 
     return app
 
+
+# --- Async main replacement for Python 3.12/13 ---
 async def main():
+    await seed_bootstrap()
     app = build_application()
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await asyncio.Event().wait()
+    await app.updater.wait()
+    await app.stop()
+    await app.shutdown()
 
-# =========================
-# STARTUP (simplified, PTB 21.x)
-# =========================
-def _homba_main():
-    app = build_application()
-    import asyncio
-    asyncio.run(seed_bootstrap())
-    from telegram import Update
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
-    _homba_main()
+if __name__ == "__main__":
+    asyncio.run(main())
