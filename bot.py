@@ -1233,16 +1233,22 @@ def build_application() -> Application:
     return app
 
 
-# --- Async main replacement for Python 3.12/13 ---
-def main():
-    # make sure DB tables/admin exist
-    import asyncio as _asyncio
-    _asyncio.run(seed_bootstrap())
+# --- Startup for Python 3.12/3.13 + PTB 21.x ---
+import asyncio
+
+async def main():
+    # make sure tables + default admin exist
+    await seed_bootstrap()
 
     app = build_application()
-    # PTB 21.x safe: manages its own loop
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    # explicit lifecycle (async) — this avoids the "no current event loop" crash
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.updater.idle()          # <- blocks until stop signal
+    await app.stop()
+    await app.shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
