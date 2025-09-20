@@ -1234,16 +1234,15 @@ def build_application() -> Application:
 
 
 # --- Async main replacement for Python 3.12/13 ---
-async def main():
-    await seed_bootstrap()
+def main():
+    # make sure DB tables/admin exist
+    import asyncio as _asyncio
+    _asyncio.run(seed_bootstrap())
+
     app = build_application()
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app.updater.wait()
-    await app.stop()
-    await app.shutdown()
+    # PTB 21.x safe: manages its own loop
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
