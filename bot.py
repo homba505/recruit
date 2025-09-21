@@ -1233,22 +1233,19 @@ def build_application() -> Application:
     return app
 
 
-# --- Startup for Python 3.12/3.13 + PTB 21.x ---
-import asyncio
-
-async def main():
-    # make sure tables + default admin exist
-    await seed_bootstrap()
-
-    app = build_application()
-    # explicit lifecycle (async) — this avoids the "no current event loop" crash
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app.updater.idle()          # <- blocks until stop signal
-    await app.stop()
-    await app.shutdown()
-
+# --- Python 3.12/3.13 + PTB 21.6 safe startup (FINAL) ---
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio as _asyncio
 
+    # Create & set an event loop (required on Python 3.12+)
+    _loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(_loop)
+
+    # Ensure DB tables + default admin exist BEFORE starting the bot
+    # (seed_bootstrap must be an async function in your file, as before)
+    _loop.run_until_complete(seed_bootstrap())
+
+    # Build the PTB application and let PTB manage polling
+    app = build_application()
+    # Do NOT call app.initialize/start/stop/updater.idle()/wait etc.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
