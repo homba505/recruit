@@ -1,17 +1,11 @@
-
-# bot.py — HOMBA Recruit Bot (Python 3.12/3.13, PTB 21.x)
-# Triple-checked build with fixed conversations, menus, admin/HR commands,
-# audit logger, archive/company mirroring, and default admin credentials.
-# Defaults:
-#   ADMIN username = HOMBA
-#   ADMIN password = belusha2025
-#
-# Environment variables expected:
-#   TELEGRAM_BOT_TOKEN   -> required
-#   DATABASE_URL         -> required by your db layer
-#   ARCHIVE_CHAT_ID      -> optional (-100...)
-#   AUDIT_CHAT_ID        -> optional (-100...)
-#   WEEKLY_REPORT_CHAT_ID-> optional (-100...)
+# bot.py — HOMBA Recruit Bot (Python 3.12/3.13, python-telegram-bot v21.x)
+# Features:
+# - Login via /start button or /login prompts; supports /login <user> <pass>
+# - Recruiter menu (/menu): /new, /my_drivers, /help, /logout
+# - HR/Admin tools: add/rename/set_pass/del users, companies, weekly report, notes, statuses
+# - Posts to Company, mirrors PDF to Archive, logs to Audit; error handler mirrors to Audit
+# - Inline company pickers reliable (per_message=True); unknown command handler is last
+# - Seeds default admin: HOMBA / belusha2025
 
 import os
 import re
@@ -44,9 +38,9 @@ from telegram.ext import (
     filters,
 )
 
-# ===== DB imports (keep as in your project) =====
+# ===== DB imports (keep your project modules unchanged) =====
 from db import Base, engine, AsyncSessionLocal
-from db_models import User, Company, Driver, DriverReply
+from db_models import User, Company, Driver
 import crud
 
 # =========================
@@ -57,7 +51,7 @@ if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
 DEFAULT_ADMIN_USERNAME = "HOMBA"
-DEFAULT_ADMIN_PASSWORD = "belusha2025"   # as requested, hard default (env override removed by design)
+DEFAULT_ADMIN_PASSWORD = "belusha2025"  # as requested
 
 PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
 
@@ -96,8 +90,7 @@ def _int_or_same(chat_id_env: Optional[str]):
         return None
     s = str(chat_id_env).strip()
     try:
-        # allow -100... numbers
-        return int(s)
+        return int(s)  # handle -100... ints
     except Exception:
         return s
 
@@ -329,12 +322,9 @@ async def generate_weekly_report_pdf(days: int = 7) -> str:
     c.setFont("Helvetica-Bold", 14)
     c.drawString(40, y, "Status Breakdown"); y -= 16
     c.setFont("Helvetica", 12)
-    if status_rows:
-        for st, cnt in status_rows:
-            c.drawString(50, y, f"{(st or '—').upper()}: {int(cnt or 0)}"); y -= 16
-            if y < 80: c.showPage(); y = H - 60
-    else:
-        c.drawString(50, y, "No data"); y -= 16
+    for st, cnt in status_rows:
+        c.drawString(50, y, f"{(st or '—').upper()}: {int(cnt or 0)}"); y -= 16
+        if y < 80: c.showPage(); y = H - 60
 
     y -= 10
     c.setFont("Helvetica-Bold", 14)
@@ -369,6 +359,29 @@ async def cb_login_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Enter username:")
     return S_LOGIN_USERNAME
 
+async def login_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /login <username> <password> OR prompts
+    if context.args and len(context.args) >= 2:
+        uname = context.args[0]
+        pwd = " ".join(context.args[1:])
+        user = await crud.get_user_by_username(uname)
+        if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
+            await update.message.reply_text("❌ Invalid credentials or inactive user.")
+            return ConversationHandler.END
+        try:
+            await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
+        except Exception:
+            pass
+        SESSIONS[update.effective_chat.id] = user.id
+        await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
+        return ConversationHandler.END
+    await update.message.reply_text("Enter username:")
+    return S_LOGIN_USERNAME
+
+async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Login canceled. Use /start or /login to try again.")
+    return ConversationHandler.END
+
 async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["login_username"] = (update.message.text or "").strip()
     await update.message.reply_text("Enter password:")
@@ -381,7 +394,6 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
         await update.message.reply_text("❌ Invalid credentials or inactive user.")
         return ConversationHandler.END
-    # link telegram id for notifications
     try:
         await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
     except Exception:
@@ -390,32 +402,6 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
     return ConversationHandler.END
 
-
-# ---- EXTRA LOGIN COMMANDS ----
-async def login_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enter username:")
-    return S_LOGIN_USERNAME
-
-async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Login canceled. Use /start or /login to try again.")
-    return ConversationHandler.END
-
-async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /auth <username> <password>")
-        return
-    uname = context.args[0]
-    pwd = " ".join(context.args[1:])
-    user = await crud.get_user_by_username(uname)
-    if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
-        await update.message.reply_text("❌ Invalid credentials or inactive user.")
-        return
-    try:
-        await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
-    except Exception:
-        pass
-    SESSIONS[update.effective_chat.id] = user.id
-    await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
 # ---- NEW DRIVER ----
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -580,7 +566,6 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_media_group(chat_id=_int_or_same(company.telegram_chat_id), media=media)
         except BadRequest:
-            # fallback one by one
             try:
                 if fid1: await context.bot.send_photo(_int_or_same(company.telegram_chat_id), fid1, caption="CDL")
                 if fid2: await context.bot.send_photo(_int_or_same(company.telegram_chat_id), fid2, caption="Medical Card")
@@ -721,7 +706,6 @@ async def set_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crud.set_driver_status(driver_id, new_status)
     await update.effective_chat.send_message(f"✅ Status for #D{driver_id} set to {new_status}.")
 
-    # notify recruiter
     recruiter = await crud.get_user(d.recruiter_id)
     if recruiter and recruiter.telegram_id:
         try:
@@ -940,7 +924,7 @@ async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Unknown command. Type /help for the list.")
 
 # =========================
-# Admin/HR command handlers (full definitions)
+# Admin/HR command handlers
 # =========================
 async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /add_user <username> <password> [role]
@@ -959,7 +943,7 @@ async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = args[1].strip()
     role = (args[2].strip().lower() if len(args) >= 3 else "recruiter")
     if me.role == "hr_manager":
-        role = "recruiter"  # HR can only add recruiters under themselves
+        role = "recruiter"
 
     try:
         if me.role == "admin":
@@ -1229,7 +1213,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("admin", admin_menu))
-    app.add_handler(CommandHandler("auth", auth_cmd))
 
     app.add_handler(CommandHandler("add_user", add_user_cmd))
     app.add_handler(CommandHandler("rename_user", rename_user_cmd))
@@ -1249,9 +1232,12 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("offers", offers_cmd))
     app.add_handler(CommandHandler("weekly_report", weekly_report_cmd))
 
-    # login flow
+    # login flow (button OR /login)
     login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$"), CommandHandler("login", login_begin)],
+        entry_points=[
+            CallbackQueryHandler(cb_login_button, pattern=r"^login$"),
+            CommandHandler("login", login_begin),
+        ],
         states={
             S_LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             S_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
@@ -1266,7 +1252,7 @@ def build_application() -> Application:
     note_conv = ConversationHandler(
         entry_points=[CommandHandler("note", cmd_note)],
         states={ S_NOTE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_note_text)] },
-        fallbacks=[CommandHandler("cancel", cancel_login)],
+        fallbacks=[],
         per_chat=True, per_user=True, per_message=True,
         name="note_flow",
     )
@@ -1286,7 +1272,7 @@ def build_application() -> Application:
             S_NEW_FILE2: [MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, take_file2)],
             S_PICK_COMPANY: [CallbackQueryHandler(cb_pick_company, pattern=r"^pickco:\d+$")],
         },
-        fallbacks=[CommandHandler("cancel", cancel_login)],
+        fallbacks=[],
         per_chat=True, per_user=True, per_message=True,
         name="new_driver",
     )
