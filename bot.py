@@ -17,6 +17,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -44,7 +46,8 @@ if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
 DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "HOMBA")
-DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fayzo2008")
+# Changed default from the old "f..." to belusha2025 as requested
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "belusha2025")
 
 PDF_DIR = os.getenv("PDF_DIR", "pdf_out")
 
@@ -89,7 +92,7 @@ async def _try_send_audit(context: ContextTypes.DEFAULT_TYPE, text: str):
         return
     try:
         chat_id = int(AUDIT_CHAT_ID) if AUDIT_CHAT_ID.lstrip("-").isdigit() else AUDIT_CHAT_ID
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
     except Exception:
         pass
 
@@ -353,7 +356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, chat_id)
     if u:
         await update.effective_chat.send_message(
-            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins/HR: /admin • /weekly_report"
+            f"Hi {u.username}! 👋\nUse /new to submit a driver.\nAdmins/HR: /admin • /weekly_report\nOpen /menu for quick buttons."
         )
     else:
         await update.effective_chat.send_message(
@@ -383,7 +386,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
     SESSIONS[update.effective_chat.id] = user.id
-    await update.message.reply_text(f"✅ Logged in as {user.username}. Use /new to submit a driver.")
+    await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
     return ConversationHandler.END
 
 
@@ -620,6 +623,7 @@ async def cb_pick_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
     if not u:
+        await update.effective_chat.send_message("Admins/HR only.")
         return
     if u.role == "admin":
         kb = InlineKeyboardMarkup([
@@ -745,124 +749,6 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML); return
 
 
-# ---- ADMIN QUICK COMMANDS ----
-async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u: return
-
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /add_user <username> <password> [role]")
-        return
-
-    req_role = context.args[2] if len(context.args) >= 3 else "recruiter"
-
-    if u.role == "admin":
-        ok, err = await crud.create_user(context.args[0], context.args[1], role=req_role, manager_id=None)
-        await update.effective_chat.send_message("✅ Created" if ok else f"❌ {err or 'Failed'}")
-        return
-
-    if u.role == "hr_manager":
-        if req_role != "recruiter":
-            await update.effective_chat.send_message("HR Managers can only create recruiters.")
-            return
-        ok, err = await crud.create_user(context.args[0], context.args[1], role="recruiter", manager_id=u.id)
-        await update.effective_chat.send_message("✅ Recruiter created" if ok else f"❌ {err or 'Failed'}")
-        return
-
-    await update.effective_chat.send_message("You don't have permission to add users.")
-
-
-async def rename_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u: return
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /rename_user <user_id> <new_username>")
-        return
-    target_id = int(context.args[0]); new_name = context.args[1]
-
-    if u.role == "admin":
-        ok, err = await crud.update_user_username(target_id, new_name)
-        await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
-        return
-
-    if u.role == "hr_manager":
-        if not await crud.is_in_team(u.id, target_id):
-            await update.effective_chat.send_message("You can only rename recruiters in your team."); return
-        ok, err = await crud.update_user_username(target_id, new_name)
-        await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
-        return
-
-    await update.effective_chat.send_message("You don't have permission to rename users.")
-
-
-async def pass_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u: return
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /set_pass <user_id> <new_password>")
-        return
-    target_id = int(context.args[0]); new_pw = context.args[1]
-
-    if u.role == "admin":
-        await crud.update_user_password(target_id, new_pw)
-        await update.effective_chat.send_message("✅ Password changed"); return
-
-    if u.role == "hr_manager":
-        if not await crud.is_in_team(u.id, target_id):
-            await update.effective_chat.send_message("You can only change passwords for your team."); return
-        await crud.update_user_password(target_id, new_pw)
-        await update.effective_chat.send_message("✅ Password changed"); return
-
-    await update.effective_chat.send_message("You don't have permission to change passwords.")
-
-
-async def del_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u: return
-    if not context.args:
-        await update.effective_chat.send_message("Usage: /del_user <user_id>"); return
-    if u.role != "admin":
-        await update.effective_chat.send_message("Only admins can delete users."); return
-    await crud.delete_user(int(context.args[0]))
-    await update.effective_chat.send_message("🗑 Deleted")
-
-
-async def add_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin": return
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /add_company <name> <chat_id>"); return
-    ok, err = await crud.create_company(context.args[0], context.args[1])
-    await update.effective_chat.send_message("✅ Added" if ok else f"❌ {err or 'Failed'}")
-
-
-async def rename_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin": return
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /rename_company <company_id> <new_name>"); return
-    ok, err = await crud.rename_company(int(context.args[0]), context.args[1])
-    await update.effective_chat.send_message("✅ Renamed" if ok else f"❌ {err or 'Failed'}")
-
-
-async def company_chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin": return
-    if len(context.args) < 2:
-        await update.effective_chat.send_message("Usage: /set_company_chat <company_id> <chat_id>"); return
-    await crud.change_company_chat_id(int(context.args[0]), context.args[1])
-    await update.effective_chat.send_message("🔁 Chat ID changed")
-
-
-async def del_company_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = await require_user(context, update.effective_chat.id)
-    if not u or u.role != "admin": return
-    if not context.args:
-        await update.effective_chat.send_message("Usage: /del_company <company_id>"); return
-    await crud.delete_company(int(context.args[0]))
-    await update.effective_chat.send_message("🗑 Deleted")
-
-
 # ---- LEADERBOARD / REPORT ----
 async def send_leaderboard_now(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
     text = "🏆 Recruiter Leaderboard (weekly)\n(placeholder from stored stats)"
@@ -908,6 +794,19 @@ async def my_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{u.id}. {u.username} ({'✅' if u.is_active else '❌'})" for u in team]
     await update.effective_chat.send_message("👥 <b>Your Recruiters</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
+async def my_drivers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await require_user(context, update.effective_chat.id)
+    if not me:
+        await update.effective_chat.send_message("You need to log in."); return
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(
+            select(Driver).where(Driver.recruiter_id == me.id).order_by(Driver.id.desc()).limit(10)
+        )
+        items = rows.scalars().all()
+    if not items:
+        await update.effective_chat.send_message("You have no submitted drivers yet. Use /new."); return
+    out = "\n".join([f"#D{d.id} — {(d.name or '—')} — {d.status}" for d in items])
+    await update.effective_chat.send_message(out)
 
 async def set_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -1052,7 +951,7 @@ async def take_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---- HELP / LOGOUT / CHATID / OFFERS / UNKNOWN ----
+# ---- HELP / MENU / LOGOUT / CHATID / OFFERS / UNKNOWN ----
 def offers_text() -> str:
     return textwrap.dedent("""
     <b>HOMBA Pricing Options</b>
@@ -1065,12 +964,31 @@ def offers_text() -> str:
     Ask us to switch your company to the plan you prefer.
     """).strip()
 
+def _menu_kb(role: Optional[str]) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("/new"), KeyboardButton("/my_drivers")],
+        [KeyboardButton("/help"), KeyboardButton("/logout")],
+    ]
+    if role in ("hr_manager", "admin"):
+        rows.insert(0, [KeyboardButton("/my_team"), KeyboardButton("/weekly_report")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await require_user(context, update.effective_chat.id)
+    if not me:
+        await update.effective_chat.send_message("You need to log in first.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]]))
+        return
+    await update.message.reply_text("📋 Menu", reply_markup=_menu_kb(me.role))
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await require_user(context, update.effective_chat.id)
     base = [
         "👤 <b>Recruiters</b>",
         "  /start – begin / login",
+        "  /menu – open quick buttons",
         "  /new – submit a new driver",
+        "  /my_drivers – list last 10 you submitted",
         "  /driver &lt;driver_id&gt; – view driver status",
         "  /logout – log out",
     ]
@@ -1155,6 +1073,7 @@ def build_application() -> Application:
     # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("admin", admin_menu))
 
@@ -1169,6 +1088,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("del_company", del_company_cmd))
 
     app.add_handler(CommandHandler("my_team", my_team_cmd))
+    app.add_handler(CommandHandler("my_drivers", my_drivers_cmd))
     app.add_handler(CommandHandler("set_status", set_status_cmd))
     app.add_handler(CommandHandler("driver", driver_cmd))
     app.add_handler(CommandHandler("chatid", chatid))
@@ -1185,6 +1105,7 @@ def build_application() -> Application:
         fallbacks=[],
         per_chat=True,
         per_user=True,
+        per_message=True,  # important so inline callbacks always get tracked
         name="login",
     )
     app.add_handler(login_conv)
@@ -1196,6 +1117,7 @@ def build_application() -> Application:
         fallbacks=[],
         per_chat=True,
         per_user=True,
+        per_message=True,
         name="note_flow",
     )
     app.add_handler(note_conv)
@@ -1217,6 +1139,7 @@ def build_application() -> Application:
         fallbacks=[],
         per_chat=True,
         per_user=True,
+        per_message=True,  # key fix for inline buttons in conv
         name="new_driver",
     )
     app.add_handler(new_conv)
@@ -1230,6 +1153,13 @@ def build_application() -> Application:
     # unknown commands last
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
+    # Error handler → Audit
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+        import traceback
+        tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+        await _try_send_audit(context, f"⚠️ Exception:\n{context.error}\n\n{tb[-3500:]}")
+    app.add_error_handler(_on_error)
+
     return app
 
 
@@ -1242,7 +1172,6 @@ if __name__ == "__main__":
     _asyncio.set_event_loop(_loop)
 
     # Ensure DB tables + default admin exist BEFORE starting the bot
-    # (seed_bootstrap must be an async function in your file, as before)
     _loop.run_until_complete(seed_bootstrap())
 
     # Build the PTB application and let PTB manage polling
