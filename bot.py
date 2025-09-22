@@ -390,6 +390,32 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
     return ConversationHandler.END
 
+
+# ---- EXTRA LOGIN COMMANDS ----
+async def login_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Enter username:")
+    return S_LOGIN_USERNAME
+
+async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Login canceled. Use /start or /login to try again.")
+    return ConversationHandler.END
+
+async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /auth <username> <password>")
+        return
+    uname = context.args[0]
+    pwd = " ".join(context.args[1:])
+    user = await crud.get_user_by_username(uname)
+    if not user or not user.is_active or not crud.check_pw(pwd, user.password_hash):
+        await update.message.reply_text("❌ Invalid credentials or inactive user.")
+        return
+    try:
+        await crud.set_user_telegram_id(user.id, str(update.effective_user.id))
+    except Exception:
+        pass
+    SESSIONS[update.effective_chat.id] = user.id
+    await update.message.reply_text(f"✅ Logged in as {user.username}. Use /menu for quick buttons.")
 # ---- NEW DRIVER ----
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = await require_user(context, update.effective_chat.id)
@@ -1203,6 +1229,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("admin", admin_menu))
+    app.add_handler(CommandHandler("auth", auth_cmd))
 
     app.add_handler(CommandHandler("add_user", add_user_cmd))
     app.add_handler(CommandHandler("rename_user", rename_user_cmd))
@@ -1224,12 +1251,12 @@ def build_application() -> Application:
 
     # login flow
     login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$")],
+        entry_points=[CallbackQueryHandler(cb_login_button, pattern=r"^login$"), CommandHandler("login", login_begin)],
         states={
             S_LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             S_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel_login)],
         per_chat=True, per_user=True, per_message=True,
         name="login",
     )
@@ -1239,7 +1266,7 @@ def build_application() -> Application:
     note_conv = ConversationHandler(
         entry_points=[CommandHandler("note", cmd_note)],
         states={ S_NOTE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, take_note_text)] },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel_login)],
         per_chat=True, per_user=True, per_message=True,
         name="note_flow",
     )
@@ -1259,7 +1286,7 @@ def build_application() -> Application:
             S_NEW_FILE2: [MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, take_file2)],
             S_PICK_COMPANY: [CallbackQueryHandler(cb_pick_company, pattern=r"^pickco:\d+$")],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel_login)],
         per_chat=True, per_user=True, per_message=True,
         name="new_driver",
     )
