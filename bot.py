@@ -782,7 +782,7 @@ async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_role("admin")
 async def cmd_add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").split(maxsplit=2)
-    # Support: /add_company <name> [chat_id]
+    # Usage: /add_company <name> [chat_id]
     if len(parts) < 2:
         await update.message.reply_text("Usage: /add_company <name> [chat_id]")
         return
@@ -792,19 +792,8 @@ async def cmd_add_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await crud.create_company(name, chat_id)
         ok = res if isinstance(res, bool) else (res[0] if isinstance(res, tuple) else True)
         await update.message.reply_text("✅ Company added." if ok else "Failed.")
-    except TypeError:
-        # Backward compatibility in case create_company requires both args strictly
-        try:
-            res = await crud.create_company(name, chat_id or None)
-            ok = res if isinstance(res, bool) else (res[0] if isinstance(res, tuple) else True)
-            await update.message.reply_text("✅ Company added." if ok else "Failed.")
-        except Exception as e:
-            await update.message.reply_text(f"Failed: {e}")
     except Exception as e:
         await update.message.reply_text(f"Failed: {e}")
-
-@require_role("admin")
-async def cmd_rename_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_role("admin")
 async def cmd_rename_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts=(update.message.text or "").split(maxsplit=2)
