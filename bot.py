@@ -1068,11 +1068,20 @@ async def _patched_main():
                 pass
     await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
     import asyncio
+
     try:
         Log.init()
     except Exception:
         pass
-    asyncio.run(_patched_main())
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_patched_main())
+    except RuntimeError:
+        # If a loop is already running (like on Render), create a task instead
+        asyncio.get_event_loop().create_task(_patched_main())
+        asyncio.get_event_loop().run_forever()
