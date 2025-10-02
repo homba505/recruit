@@ -1082,6 +1082,6 @@ if __name__ == "__main__":
         loop = asyncio.get_event_loop()
         loop.run_until_complete(_patched_main())
     except RuntimeError:
-        # If a loop is already running (like on Render), create a task instead
         asyncio.get_event_loop().create_task(_patched_main())
         asyncio.get_event_loop().run_forever()
+
