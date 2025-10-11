@@ -53,6 +53,18 @@ if not BOT_TOKEN:
 
 # Emergency kill-switch to completely silence group processing (we'll wire listeners later)
 SAFE_GROUP_MODE: bool = os.getenv("SAFE_GROUP_MODE", "0") == "1"
+ARCHIVE_CHAT_ID_RAW = os.getenv("ARCHIVE_CHAT_ID", "").strip()
+AUDIT_CHAT_ID_RAW   = os.getenv("AUDIT_CHAT_ID", "").strip()
+
+def _to_int_or_none(v: str):
+    try:
+        return int(v) if v else None
+    except Exception:
+        return None
+
+ARCHIVE_CHAT_ID = _to_int_or_none(ARCHIVE_CHAT_ID_RAW)
+AUDIT_CHAT_ID   = _to_int_or_none(AUDIT_CHAT_ID_RAW)
+
 
 # Role names we’ll use everywhere
 ROLE_ADMIN = "admin"
@@ -82,7 +94,7 @@ async def current_user(update: Update) -> Optional[User]:
         return None
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(User).where(User.telegram_id == tg_id))
-        return res.scalar_one_or_none()
+        return res.scalars().first()
 
 
 # =========================
@@ -109,7 +121,7 @@ def require_login(func: Callable[..., Awaitable[Any]]):
             return
         # Attach for downstream handlers if they want it
         context.user_data["me"] = user
-        return
+        return await func(update, context, *args, **kwargs)
     
     return wrapper
 
@@ -139,7 +151,7 @@ def require_role(*allowed_roles: str):
                     await update.effective_message.reply_text("You don’t have permission for this command.")
                 return
             context.user_data["me"] = user
-            return await func(update, context, user, *args, **kwargs)
+            return await func(update, context, *args, **kwargs)
         return wrapper
     return deco
 
@@ -202,6 +214,39 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = _help_text_for(user.role if user else None)
     if update.effective_message:
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+# ---------- Audit & Archive helpers ----------
+async def send_audit(context, text: str):
+    if not AUDIT_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=AUDIT_CHAT_ID, text=text)
+    except Exception:
+        pass
+
+async def archive_copy_message(context, from_chat_id: int | str, message_id: int):
+    if not ARCHIVE_CHAT_ID:
+        return
+    try:
+        await context.bot.copy_message(
+            chat_id=ARCHIVE_CHAT_ID,
+            from_chat_id=int(from_chat_id),
+            message_id=int(message_id),
+        )
+    except Exception:
+        pass
+
+async def archive_send_document(context, fileobj, filename: str, caption: str | None = None):
+    if not ARCHIVE_CHAT_ID:
+        return
+    try:
+        await context.bot.send_document(
+            chat_id=ARCHIVE_CHAT_ID,
+            document=fileobj,
+            filename=filename,
+            caption=caption,
+        )
+    except Exception:
+        pass
 
 
 # =========================
@@ -345,6 +390,14 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Logged in as <b>{u.username}</b> ({u.role}).",
         parse_mode=ParseMode.HTML,
     )
+        # audit log
+    try:
+        me = await current_user(update)
+        if me:
+            await send_audit(context, f"🔐 Login: @{me.username} (id={me.id}, tg={update.effective_user.id})")
+    except Exception:
+        pass
+
     # Show role-specific help next
     await cmd_help(update, context)
     return ConversationHandler.END
@@ -363,6 +416,13 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Logout error: {e}")
         return
     await update.effective_message.reply_text("✅ Logged out. Use /start to log in again.")
+    # audit log
+    try:
+        me = context.user_data.get("me")
+        if me:
+            await send_audit(context, f"🔓 Logout: @{me.username} (id={me.id}, tg={update.effective_user.id})")
+    except Exception:
+        pass
 
 
 def wire_phase2_auth(app: Application) -> None:
@@ -1034,7 +1094,7 @@ async def cmd_my_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for d in drivers:
-        lines.append(f"{d.id}. {getattr(d, 'full_name', getattr(d, 'name', '-'))} — {d.phone} — status={getattr(d, 'status', '-')}")
+                lines.append(f"{d.id}. {getattr(d, 'full_name', getattr(d, 'name', '-'))} — {d.phone} — status={getattr(d, 'status', '-')}")
     await update.effective_message.reply_text("\n".join(lines))
 
 def wire_phase5_drivers(app: Application) -> None:
@@ -1265,6 +1325,12 @@ async def post_driver_card(context: ContextTypes.DEFAULT_TYPE, driver) -> None:
         )
         # 2) Store anchor
         await crud.set_driver_group_msg_id(driver.id, sent.message_id)
+        # mirror the card into the Archive group (if configured)
+        try:
+            await archive_copy_message(context, from_chat_id=chat_id, message_id=sent.message_id)
+        except Exception:
+            pass
+
         # You may log ok/err; we keep silent in chat.
     except Exception:
         # Swallow errors to avoid breaking submission; you can log if you have logging.
