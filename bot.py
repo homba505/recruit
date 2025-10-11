@@ -275,13 +275,19 @@ def build_app() -> Application:
 # =========================
 
 def main() -> Application:
-     """
-     Build & wire the app.
-     """
-     app = build_app()
-     wire_phase2_auth(app); wire_phase3_users(app); wire_phase4_companies(app)
-     wire_phase5_drivers(app); wire_phase6_reports(app); wire_phase7_groups(app); wire_phase8_polish(app)
-     return app
+    """
+    Build & wire the app with all phases.
+    """
+    app = build_app()
+    wire_phase2_auth(app)
+    wire_phase3_users(app)
+    wire_phase4_companies(app)
+    wire_phase5_drivers(app)
+    wire_phase6_reports(app)
+    wire_phase7_groups(app)
+    wire_phase8_polish(app)
+    return app
+
 
 # =========================
 #   PHASE 2 — Auth & Login
