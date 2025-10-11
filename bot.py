@@ -1565,15 +1565,13 @@ def wire_phase8_polish(app: Application) -> None:
     app.add_handler(CommandHandler("unmute_groups", cmd_unmute_groups))
     
 if __name__ == "__main__":
-    # Avoid "RuntimeError: This event loop is already running" on Render/Jupyter-like runtimes.
-    import nest_asyncio  # make sure 'nest_asyncio' is in requirements.txt
+    import asyncio, nest_asyncio
     nest_asyncio.apply()
 
     app = main()
-    try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(app.run_polling(allowed_updates=Update.ALL_TYPES))
-    except RuntimeError:
-        # If a loop is already running (some platforms), schedule and keep alive
-        asyncio.get_event_loop().create_task(app.run_polling(allowed_updates=Update.ALL_TYPES))
-        asyncio.get_event_loop().run_forever()
+
+    async def _run():
+        print("🚀 Starting polling...")
+        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    asyncio.run(_run())
