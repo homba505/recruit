@@ -281,10 +281,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ==============================================================
+# ================================
 # Application factory & entrypoint
-# ==============================================================
-
+# ================================
 def build_application():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -296,28 +295,37 @@ def build_application():
     app.add_handler(CommandHandler("logout", cmd_logout))
 
     # Menu button router
-    app.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(on_menu_button, pattern="^menu:"))
 
     # Errors
     app.add_error_handler(on_error)
 
+    # Load all parts after they are defined
+    init_all_parts(app)
+
+    return app
+
+
+# --- combine all register_partX here (added just above main) ---
+def init_all_parts(app):
     register_part2(app)
     register_part3(app)
     register_part4(app)
     register_part5(app)
     register_part6(app)
-    return app
+# --- end of init_all_parts ---
 
 
 def main() -> None:
-    log.info("Starting HOMBA Recruit Bot")
+    log.info("Starting HOMBA Recruit Bot…")
     app = build_application()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=None)
     log.info("Bot stopped.")
 
 
 if __name__ == "__main__":
     main()
+
 # ==============================================================
 # Part 2: Login flow + Admin & HR user management UI
 # ==============================================================
