@@ -459,9 +459,12 @@ line(f"Experience (months): {getattr(d,'exp_months','')}")
 line(f"Escrow: {getattr(d,'escrow','')}")
 line(f"Ready date: {getattr(d,'ready_date','')}")
 
+# ✅ These two lines must be at the same level as the lines above
+c.showPage()
+c.save()
 
-    c.showPage()
-    c.save()
+return buf.getvalue(), f"driver_{driver_id}.pdf"
+
 
     return buf.getvalue(), f"driver_{driver_id}.pdf"
 
