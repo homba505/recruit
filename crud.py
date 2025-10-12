@@ -436,10 +436,17 @@ async def generate_driver_pdf(driver_id: int) -> tuple[Optional[bytes], Optional
         c.setFont(*font)
         c.drawString(20*mm, y, txt)
         y -= step
+from reportlab.lib.utils import ImageReader
+import os
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(20*mm, y, "Driver Submission")
-    y -= 10*mm
+logo_path = os.path.join("assets", "logo.png")
+if os.path.exists(logo_path):
+    c.drawImage(ImageReader(logo_path), 20*mm, y - 15*mm, width=40*mm, preserveAspectRatio=True)
+    y -= 25*mm  # move down after drawing the logo
+
+c.setFont("Helvetica-Bold", 16)
+c.drawString(20*mm, y, "Driver Submission")
+y -= 10*mm
 
     line(f"Driver ID: {getattr(d,'id','')}")
     line(f"Created: {created_s}")
