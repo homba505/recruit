@@ -309,11 +309,11 @@ def build_application():
     return app
 
 def main() -> None:
-    log.info("Starting HOMBA Recruit Bot…")
+    log.info("Starting HOMBA Recruit Bot")
     app = build_application()
-    app.run_polling(allowed_updates=None)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
     log.info("Bot stopped.")
-    
+
 
 if __name__ == "__main__":
     main()
