@@ -436,38 +436,33 @@ async def generate_driver_pdf(driver_id: int) -> tuple[Optional[bytes], Optional
         c.setFont(*font)
         c.drawString(20*mm, y, txt)
         y -= step
-from reportlab.lib.utils import ImageReader
-import os
+    from reportlab.lib.utils import ImageReader
+    import os
 
-logo_path = os.path.join("assets", "logo.png")
-if os.path.exists(logo_path):
-    c.drawImage(ImageReader(logo_path), 20*mm, y - 15*mm, width=40*mm, preserveAspectRatio=True)
-    y -= 25*mm  # move down after drawing the logo
+    logo_path = os.path.join("assets", "logo.png")
+    if os.path.exists(logo_path):
+        c.drawImage(ImageReader(logo_path), 20*mm, y - 15*mm, width=40*mm, preserveAspectRatio=True)
+        y -= 25*mm  # move down after drawing the logo
 
-c.setFont("Helvetica-Bold", 16)
-c.drawString(20*mm, y, "Driver Submission")
-y -= 10*mm
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20*mm, y, "Driver Submission")
+    y -= 10*mm
 
-line(f"Driver ID: {getattr(d,'id','')}")
-line(f"Created: {created_s}")
-line(f"Recruiter: {recruiter}")
-line(f"Company: {company}")
-line(f"Status: {getattr(d,'status','')}")
-line(f"FMID: {getattr(d,'fmid','')}")
-line(f"Name: {getattr(d,'name','')}")
-line(f"Experience (months): {getattr(d,'exp_months','')}")
-line(f"Escrow: {getattr(d,'escrow','')}")
-line(f"Ready date: {getattr(d,'ready_date','')}")
+    line(f"Driver ID: {getattr(d,'id','')}")
+    line(f"Created: {created_s}")
+    line(f"Recruiter: {recruiter}")
+    line(f"Company: {company}")
+    line(f"Status: {getattr(d,'status','')}")
+    line(f"FMID: {getattr(d,'fmid','')}")
+    line(f"Name: {getattr(d,'name','')}")
+    line(f"Experience (months): {getattr(d,'exp_months','')}")
+    line(f"Escrow: {getattr(d,'escrow','')}")
+    line(f"Ready date: {getattr(d,'ready_date','')}")
 
-# ✅ These two lines must be at the same level as the lines above
-c.showPage()
-c.save()
-
-return buf.getvalue(), f"driver_{driver_id}.pdf"
-
+    c.showPage()
+    c.save()
 
     return buf.getvalue(), f"driver_{driver_id}.pdf"
-
 # === Compatibility helpers for test.py ===
 
 async def get_company(company_id: int):
