@@ -300,13 +300,14 @@ def build_application():
 
     # Errors
     app.add_error_handler(on_error)
-        # << Add this line >>
+
     register_part2(app)
     register_part3(app)
     register_part4(app)
     register_part5(app)
     register_part6(app)
     return app
+
 
 def main() -> None:
     log.info("Starting HOMBA Recruit Bot")
