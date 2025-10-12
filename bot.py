@@ -314,18 +314,6 @@ def init_all_parts(app):
     register_part5(app)
     register_part6(app)
 # --- end of init_all_parts ---
-
-
-def main() -> None:
-    log.info("Starting HOMBA Recruit Bot…")
-    app = build_application()
-    app.run_polling(allowed_updates=None)
-    log.info("Bot stopped.")
-
-
-if __name__ == "__main__":
-    main()
-
 # ==============================================================
 # Part 2: Login flow + Admin & HR user management UI
 # ==============================================================
@@ -1943,3 +1931,16 @@ def register_part6(app):
     app.add_handler(CallbackQueryHandler(on_pagination, pattern=r"^pg:(drv_recent|drv_find):\d+$|^pg:noop$"))
     app.add_handler(CommandHandler("version", cmd_version))
 
+# ==============================
+# Entrypoint
+# ==============================
+
+def main() -> None:
+    log.info("Starting HOMBA Recruit Bot…")
+    app = build_application()
+    app.run_polling(allowed_updates=None)
+    log.info("Bot stopped.")
+
+
+if __name__ == "__main__":
+    main()
